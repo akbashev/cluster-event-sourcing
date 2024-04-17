@@ -10,6 +10,7 @@ public actor ClusterJournalPlugin {
     private var factory: (ClusterSystem) async throws -> (any EventStore)
     private var emitContinuations: [PersistenceID: [CheckedContinuation<Void, Never>]] = [:]
     private var restoringActorTasks: [PersistenceID: Task<Void, Never>] = [:]
+    private var localActorChecks: [ClusterSystem.ActorID: Task<Void, Never>] = [:]
     
     public func emit<E: Codable>(_ event: E, id persistenceId: PersistenceID) async throws {
         if self.restoringActorTasks[persistenceId] != .none {
@@ -24,17 +25,17 @@ public actor ClusterJournalPlugin {
     public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) {
         /// Checking if actor is already in restoring state
         guard self.restoringActorTasks[persistenceId] == .none else { return }
-        self.restoringActorTasks[persistenceId] = Task { [weak actor, weak self] in
-            defer { Task { [weak self] in await self?.removeTaskFor(id: persistenceId) } }
+        self.restoringActorTasks[persistenceId] = Task { [weak actor] in
+            defer { self.removeTaskFor(id: persistenceId) }
             do {
-                let events: [A.Event] = (try await self?.store.eventsFor(id: persistenceId)) ?? []
+                let events: [A.Event] = try await self.store.eventsFor(id: persistenceId)
                 await actor?.whenLocal { myself in
                     for event in events {
                         myself.handleEvent(event)
                     }
                 }
             } catch {
-                await self?.actorSystem.log.error(
+                self.actorSystem.log.error(
                     "Cluster journal haven't been able to restore state of an actor \(persistenceId), reason: \(error)"
                 )
             }
@@ -60,7 +61,7 @@ public actor ClusterJournalPlugin {
     }
 }
 
-extension ClusterJournalPlugin: _Plugin {
+extension ClusterJournalPlugin: ActorLifecyclePlugin {
     static let pluginKey: Key = "$clusterJournal"
     
     public nonisolated var key: Key {
@@ -83,20 +84,27 @@ extension ClusterJournalPlugin: _Plugin {
         for emit in self.emitContinuations.values.flatMap({ $0 }) { emit.resume() }
         self.emitContinuations.removeAll()
     }
-}
-
-extension ClusterJournalPlugin: PluginActorLifecycleHook {
-    nonisolated public func actorReady<Act>(_ actor: Act) where Act : DistributedActor, Act.ID == DistributedCluster.ClusterSystem.ActorID {
-        guard let eventSourced = actor as? (any EventSourced) else { return }
-        Task { [weak eventSourced] in
-          await eventSourced?.whenLocal { [weak self] myself in
-            await self?.restoreEventsFor(actor: myself, id: myself.persistenceId)
-          }
-        }
+    
+    nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
+        Task { await self.checkActor(actor) }
     }
     
-    nonisolated public func resignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
+    nonisolated public func onResignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
         //
+    }
+    
+    private func checkActor<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
+        let id = actor.id
+        guard
+            let eventSourced = actor as? (any EventSourced),
+            self.localActorChecks[id] == .none
+        else { return }
+        self.localActorChecks[id] = Task { [weak eventSourced] in
+            defer { self.localActorChecks.removeValue(forKey: actor.id) }
+            await eventSourced?.whenLocal { [weak self] myself in
+                await self?.restoreEventsFor(actor: myself, id: myself.persistenceId)
+            }
+        }
     }
 }
 
