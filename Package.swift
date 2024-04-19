@@ -42,8 +42,11 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "cluster-event-sourcingTests",
-            dependencies: ["EventSourcing"]
+            name: "EventSourcingTests",
+            dependencies: [
+                "EventSourcing",
+                .product(name: "DistributedCluster", package: "swift-distributed-actors")
+            ]
         ),
     ]
 )

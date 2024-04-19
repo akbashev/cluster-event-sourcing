@@ -10,7 +10,9 @@ public actor ClusterJournalPlugin {
     private var factory: (ClusterSystem) async throws -> (any EventStore)
     private var emitContinuations: [PersistenceID: [CheckedContinuation<Void, Never>]] = [:]
     private var restoringActorTasks: [PersistenceID: Task<Void, Never>] = [:]
-    private var localActorChecks: [ClusterSystem.ActorID: Task<Void, Never>] = [:]
+    private var localActorChecks: [PersistenceID: Task<Void, Never>] = [:]
+    
+    private nonisolated let onActorReadyLock: _Mutex = .init()
     
     public func emit<E: Codable>(_ event: E, id persistenceId: PersistenceID) async throws {
         if self.restoringActorTasks[persistenceId] != .none {
@@ -94,15 +96,15 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
     }
     
     private func checkActor<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
-        let id = actor.id
-        guard
-            let eventSourced = actor as? (any EventSourced),
-            self.localActorChecks[id] == .none
-        else { return }
+        guard let eventSourced = actor as? (any EventSourced) else { return }
+        guard let id = eventSourced.id.metadata.persistenceID else {
+            fatalError("Persistence ID is not defined, please do it by defining an @ActorID.Metadata(\\.persistenceID) property")
+        }
+        guard self.localActorChecks[id] == .none else { return }
         self.localActorChecks[id] = Task { [weak eventSourced] in
-            defer { self.localActorChecks.removeValue(forKey: actor.id) }
+            defer { self.localActorChecks.removeValue(forKey: id) }
             await eventSourced?.whenLocal { [weak self] myself in
-                await self?.restoreEventsFor(actor: myself, id: myself.persistenceId)
+                await self?.restoreEventsFor(actor: myself, id: id)
             }
         }
     }
@@ -121,9 +123,11 @@ extension ClusterSystem {
 
 
 extension EventSourced {
+    // `whenLocal` is async atm, ideally should be non-async 🤔
     public func emit(event: Event) async throws {
+        guard let id = self.id.metadata.persistenceID else { return }
         try await self.whenLocal { [weak self] myself in
-            try await self?.actorSystem.journal.emit(event, id: myself.persistenceId)
+            try await self?.actorSystem.journal.emit(event, id: id)
             myself.handleEvent(event)
         }
     }
