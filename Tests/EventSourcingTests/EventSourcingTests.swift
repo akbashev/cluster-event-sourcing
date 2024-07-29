@@ -47,7 +47,7 @@ final class EventSourcingTests: XCTestCase {
             var messages: [String] = []
         }
         
-        enum Event: Codable {
+      enum Event: Codable, Sendable {
             case message(String)
         }
         
@@ -85,12 +85,12 @@ fileprivate class MemoryEventStore: EventStore {
     private let encoder: JSONEncoder = JSONEncoder()
     private let decoder: JSONDecoder = JSONDecoder()
     
-    func persistEvent<Event: Codable>(_ event: Event, id: PersistenceID) throws {
+    func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID) throws {
         let data = try encoder.encode(event)
         self.dict[id, default: []].append(data)
     }
     
-    func eventsFor<Event: Codable>(id: PersistenceID) throws -> [Event] {
+    func eventsFor<Event: Codable & Sendable>(id: PersistenceID) throws -> [Event] {
         self.dict[id]?.compactMap(decoder.decode) ?? []
     }
     

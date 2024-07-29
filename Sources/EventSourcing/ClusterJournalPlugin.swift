@@ -14,7 +14,7 @@ public actor ClusterJournalPlugin {
     
     private nonisolated let onActorReadyLock: _Mutex = .init()
     
-    public func emit<E: Codable>(_ event: E, id persistenceId: PersistenceID) async throws {
+    public func emit<E: Codable & Sendable>(_ event: E, id persistenceId: PersistenceID) async throws {
         if self.restoringActorTasks[persistenceId] != .none {
             await withCheckedContinuation { continuation in
                 self.emitContinuations[persistenceId, default: []].append(continuation)
@@ -138,11 +138,11 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
     
     private var store: any EventStore
     
-    distributed func persistEvent<Event: Codable>(_ event: Event, id: PersistenceID) async throws {
+    distributed func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID) async throws {
         try await store.persistEvent(event, id: id)
     }
     
-    distributed func eventsFor<Event: Codable>(id: PersistenceID) async throws -> [Event] {
+    distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID) async throws -> [Event] {
         try await store.eventsFor(id: id)
     }
     
