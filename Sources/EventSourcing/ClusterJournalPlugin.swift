@@ -7,13 +7,11 @@ public actor ClusterJournalPlugin {
     private var actorSystem: ClusterSystem!
     private var store: AnyEventStore!
     
-    private var factory: (ClusterSystem) async throws -> (any EventStore)
+    private var factory: @Sendable (ClusterSystem) async throws -> (any EventStore)
     private var emitContinuations: [PersistenceID: [CheckedContinuation<Void, Never>]] = [:]
     private var restoringActorTasks: [PersistenceID: Task<Void, Never>] = [:]
     private var localActorChecks: [PersistenceID: Task<Void, Never>] = [:]
-    
-    private nonisolated let onActorReadyLock: _Mutex = .init()
-    
+        
     public func emit<E: Codable & Sendable>(_ event: E, id persistenceId: PersistenceID) async throws {
         if self.restoringActorTasks[persistenceId] != .none {
             await withCheckedContinuation { continuation in
@@ -57,7 +55,7 @@ public actor ClusterJournalPlugin {
     }
     
     public init(
-        factory: @escaping (ClusterSystem) -> any EventStore
+        factory: @Sendable @escaping (ClusterSystem) -> any EventStore
     ) {
         self.factory = factory
     }

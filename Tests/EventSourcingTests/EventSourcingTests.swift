@@ -1,13 +1,13 @@
-import XCTest
+import Testing
+import Foundation
 @testable import EventSourcing
 @testable import DistributedCluster
 
 typealias DefaultDistributedActorSystem = ClusterSystem
 
-final class EventSourcingTests: XCTestCase {
-    
-    typealias DistributedClusterSystem = ClusterSystem
-    
+struct EventSourcingTests {
+        
+    @Test
     func test_simple_actor() async throws {
         let store = MemoryEventStore()
         let node = await ClusterSystem("simple-node") {
@@ -36,8 +36,8 @@ final class EventSourcingTests: XCTestCase {
             try await actor?.send(message: messages[1])
             try await actor?.send(message: messages[2])
             let actorMessages = try await actor?.getMessages() ?? []
-            XCTAssertEqual(actorMessages, messages, "Expected \(messages), but got \(actorMessages), iteration: \(i)")
-            store.flush()
+            #expect(actorMessages == messages, "Expected \(messages), but got \(actorMessages), iteration: \(i)")
+            await store.flush()
         }
     }
     
@@ -47,7 +47,7 @@ final class EventSourcingTests: XCTestCase {
             var messages: [String] = []
         }
         
-      enum Event: Codable, Sendable {
+        enum Event: Codable, Sendable {
             case message(String)
         }
         
@@ -74,12 +74,12 @@ final class EventSourcingTests: XCTestCase {
         
         init(actorSystem: ClusterSystem) {
             self.actorSystem = actorSystem
-            self.persistenceID = "test-actor"
+//            self.persistenceID = "test-actor"
         }
     }
 }
 
-fileprivate class MemoryEventStore: EventStore {
+actor MemoryEventStore: EventStore, Sendable {
     
     private var dict: [PersistenceID: [Data]] = [:]
     private let encoder: JSONEncoder = JSONEncoder()

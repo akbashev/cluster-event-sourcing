@@ -1,4 +1,4 @@
-// swift-tools-version: 5.7
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -29,7 +29,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/akbashev/swift-distributed-actors",
-            branch: "plugin_lifecycle_hook"
+            branch: "singleton_settings_sendable"
         )
     ],
     targets: [
@@ -48,5 +48,6 @@ let package = Package(
                 .product(name: "DistributedCluster", package: "swift-distributed-actors")
             ]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )
