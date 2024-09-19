@@ -29,7 +29,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/akbashev/swift-distributed-actors",
-            branch: "singleton_settings_sendable"
+            branch: "plugin_lifecycle_hook"
         )
     ],
     targets: [

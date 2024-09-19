@@ -51,8 +51,9 @@ struct EventSourcingTests {
             case message(String)
         }
         
-        @ActorID.Metadata(\.persistenceID)
-        var persistenceID: PersistenceID
+        // FIXME: Put back when ActorID.Metadata will be moved to macros
+//        @ActorID.Metadata(\.persistenceID)
+//        var persistenceID: PersistenceID
         
         var state: State = .init()
         
@@ -74,7 +75,10 @@ struct EventSourcingTests {
         
         init(actorSystem: ClusterSystem) {
             self.actorSystem = actorSystem
+            // FIXME: Put back when ActorID.Metadata will be moved to macros
 //            self.persistenceID = "test-actor"
+            let metadata = self.id.metadata
+            metadata["$persistenceID"] = "test-actor"
         }
     }
 }
