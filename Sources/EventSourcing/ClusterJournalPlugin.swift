@@ -10,7 +10,6 @@ public actor ClusterJournalPlugin {
     private var factory: @Sendable (ClusterSystem) async throws -> (any EventStore)
     private var emitContinuations: [PersistenceID: [CheckedContinuation<Void, Never>]] = [:]
     private var restoringActorTasks: [PersistenceID: Task<Void, Never>] = [:]
-    private var localActorChecks: [PersistenceID: Task<Void, Never>] = [:]
         
     public func emit<E: Codable & Sendable>(_ event: E, id persistenceId: PersistenceID) async throws {
         if self.restoringActorTasks[persistenceId] != .none {
@@ -86,25 +85,18 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
     }
     
     nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
-        Task { await self.checkActor(actor) }
-    }
-    
-    nonisolated public func onResignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
-        //
-    }
-    
-    private func checkActor<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
         guard let eventSourced = actor as? (any EventSourced) else { return }
         guard let id = eventSourced.id.metadata.persistenceID else {
             fatalError("Persistence ID is not defined, please do it by defining an @ActorID.Metadata(\\.persistenceID) property")
         }
-        guard self.localActorChecks[id] == .none else { return }
-        self.localActorChecks[id] = Task { [weak eventSourced] in
-            defer { self.localActorChecks.removeValue(forKey: id) }
-            await eventSourced?.whenLocal { [weak self] myself in
-                await self?.restoreEventsFor(actor: myself, id: id)
-            }
+        // FIXME: non structred, can we come up with something? 🤔
+        Task {
+            await self.restoreEventsFor(actor: eventSourced, id: id)
         }
+    }
+    
+    nonisolated public func onResignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
+        //
     }
 }
 
@@ -124,8 +116,8 @@ extension EventSourced {
     // `whenLocal` is async atm, ideally should be non-async 🤔
     public func emit(event: Event) async throws {
         guard let id = self.id.metadata.persistenceID else { return }
-        try await self.whenLocal { [weak self] myself in
-            try await self?.actorSystem.journal.emit(event, id: id)
+        try await self.whenLocal { myself in
+            try await self.actorSystem.journal.emit(event, id: id)
             myself.handleEvent(event)
         }
     }
