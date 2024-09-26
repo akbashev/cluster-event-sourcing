@@ -17,6 +17,7 @@ public actor ClusterJournalPlugin {
                 self.emitContinuations[persistenceId, default: []].append(continuation)
             }
         }
+        // FIXME: When resuming work this is reentrant and could lead to some problems.
         try await store.persistEvent(event, id: persistenceId)
     }
     
