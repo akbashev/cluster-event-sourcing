@@ -36,7 +36,7 @@ public actor ClusterJournalPlugin {
                 }
             } catch {
                 self.actorSystem.log.error(
-                    "Cluster journal haven't been able to restore state of an actor \(persistenceId), reason: \(error)"
+                    "Cluster journal haven't been able to restore state of an actor with id: \(persistenceId), reason: \(error)"
                 )
             }
         }
@@ -86,13 +86,10 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
     }
     
     nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
-        guard let eventSourced = actor as? (any EventSourced) else { return }
-        guard let id = eventSourced.id.metadata.persistenceID else {
-            fatalError("Persistence ID is not defined, please do it by defining an @ActorID.Metadata(\\.persistenceID) property")
-        }
-        // FIXME: non structred, can we come up with something? 🤔
+        // FIXME: nonstructred, can we come up with something? 🤔
         Task {
-            await self.restoreEventsFor(actor: eventSourced, id: id)
+            guard let eventSourced = actor as? (any EventSourced) else { return }
+            try await self.restoreEventsFor(actor: eventSourced, id: eventSourced.persistenceID)
         }
     }
     
@@ -116,10 +113,9 @@ extension ClusterSystem {
 extension EventSourced {
     // `whenLocal` is async atm, ideally should be non-async 🤔
     public func emit(event: Event) async throws {
-        guard let id = self.id.metadata.persistenceID else { return }
-        try await self.whenLocal { myself in
-            try await self.actorSystem.journal.emit(event, id: id)
-            myself.handleEvent(event)
+        try await self.whenLocal { local in
+            try await self.actorSystem.journal.emit(event, id: self.persistenceID)
+            local.handleEvent(event)
         }
     }
 }

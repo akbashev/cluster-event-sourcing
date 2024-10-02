@@ -29,8 +29,7 @@ distributed actor SomeActor: EventSourced {
     }
     
     // This is important to provide, events are stored per actor using persistenceID
-    @ActorID.Metadata(\.persistenceID) 
-    var persistenceID: PersistenceID 
+    distributed var persistenceID: PersistenceID { "some-actor" }
     
     distributed func doSomething() async throws {
         try await self.emit(event: .doSomething)
@@ -45,7 +44,6 @@ distributed actor SomeActor: EventSourced {
     
     init(actorSystem: ClusterSystem) {
         self.actorSystem = actorSystem
-        self.persistenceID = "some-actor"
     }
 }
 ```

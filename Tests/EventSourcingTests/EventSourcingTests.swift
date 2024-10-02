@@ -28,10 +28,10 @@ struct EventSourcingTests {
         let messages = ["hello", "test", "recovery"]
         var actor: TestActor?
         for i in 0..<2 {
-            actor = TestActor(actorSystem: node)
+            actor = await TestActor(actorSystem: node)
             try await actor?.send(message: messages[0])
             actor = .none
-            actor = TestActor(actorSystem: node)
+            actor = await TestActor(actorSystem: node)
             try await Task.sleep(for: .seconds(3)) // FIXME: Currently there is no guarantee in the system that actor will be restored properly
             try await actor?.send(message: messages[1])
             try await actor?.send(message: messages[2])
@@ -51,9 +51,11 @@ struct EventSourcingTests {
             case message(String)
         }
         
-        // FIXME: Put back when ActorID.Metadata will be moved to macros
-//        @ActorID.Metadata(\.persistenceID)
-//        var persistenceID: PersistenceID
+        distributed var persistenceID: PersistenceID {
+            _persistenceID
+        }
+        
+        private var _persistenceID: PersistenceID
         
         var state: State = .init()
         
@@ -73,12 +75,9 @@ struct EventSourcingTests {
             }
         }
         
-        init(actorSystem: ClusterSystem) {
+        init(actorSystem: ClusterSystem) async {
             self.actorSystem = actorSystem
-            // FIXME: Put back when ActorID.Metadata will be moved to macros
-//            self.persistenceID = "test-actor"
-            let metadata = self.id.metadata
-            metadata["$persistenceID"] = "test-actor"
+            self._persistenceID = "test-actor"
         }
     }
 }
