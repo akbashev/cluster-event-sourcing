@@ -9,10 +9,10 @@ platforms = nil
 #else
 platforms = [
     // we require the 'distributed actor' language and runtime feature:
-    .iOS(.v16),
-    .macOS(.v13),
-    .tvOS(.v16),
-    .watchOS(.v9),
+    .iOS(.v18),
+    .macOS(.v15),
+    .tvOS(.v18),
+    .watchOS(.v11),
 ]
 #endif
 
