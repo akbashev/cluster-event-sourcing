@@ -8,46 +8,47 @@ let platforms: [SupportedPlatform]?
 platforms = nil
 #else
 platforms = [
-    // we require the 'distributed actor' language and runtime feature:
-    .iOS(.v18),
-    .macOS(.v15),
-    .tvOS(.v18),
-    .watchOS(.v11),
+  // we require the 'distributed actor' language and runtime feature:
+  .iOS(.v18),
+  .macOS(.v15),
+  .tvOS(.v18),
+  .watchOS(.v11),
 ]
 #endif
 
 let package = Package(
-    name: "cluster-event-sourcing",
-    platforms: platforms,
-    products: [
-        // Products define the executables and libraries a package produces, making them visible to other packages.
-        .library(
-            name: "EventSourcing",
-            targets: ["EventSourcing"]
-        ),
-    ],
-    dependencies: [
-        .package(
-            url: "https://github.com/akbashev/swift-distributed-actors",
-            branch: "plugin_lifecycle_hook"
-        )
-    ],
-    targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
-        .target(
-            name: "EventSourcing",
-            dependencies: [
-                .product(name: "DistributedCluster", package: "swift-distributed-actors"),
-            ]
-        ),
-        .testTarget(
-            name: "EventSourcingTests",
-            dependencies: [
-                "EventSourcing",
-                .product(name: "DistributedCluster", package: "swift-distributed-actors")
-            ]
-        ),
-    ],
-    swiftLanguageModes: [.v6]
+  name: "cluster-event-sourcing",
+  platforms: platforms,
+  products: [
+    // Products define the executables and libraries a package produces, making them visible to other packages.
+    .library(
+      name: "EventSourcing",
+      targets: ["EventSourcing"]
+    )
+  ],
+  dependencies: [
+    // TODO: Update when all PRs are merged
+    .package(
+      url: "https://github.com/akbashev/swift-distributed-actors.git",
+      branch: "presentation"
+    )
+  ],
+  targets: [
+    // Targets are the basic building blocks of a package, defining a module or a test suite.
+    // Targets can depend on other targets in this package and products from dependencies.
+    .target(
+      name: "EventSourcing",
+      dependencies: [
+        .product(name: "DistributedCluster", package: "swift-distributed-actors")
+      ]
+    ),
+    .testTarget(
+      name: "EventSourcingTests",
+      dependencies: [
+        "EventSourcing",
+        .product(name: "DistributedCluster", package: "swift-distributed-actors"),
+      ]
+    ),
+  ],
+  swiftLanguageModes: [.v6]
 )

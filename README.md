@@ -1,4 +1,4 @@
-# Cluster EventSourcing
+# Cluster System Event Sourcing
 
 An event sourcing framework implementation for Swift distributed [Cluster System](https://github.com/apple/swift-distributed-actors).
 
