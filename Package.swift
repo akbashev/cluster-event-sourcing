@@ -27,10 +27,9 @@ let package = Package(
     )
   ],
   dependencies: [
-    // TODO: Update when all PRs are merged
     .package(
-      url: "https://github.com/akbashev/swift-distributed-actors.git",
-      branch: "presentation"
+      url: "https://github.com/apple/swift-distributed-actors.git",
+      branch: "main"
     )
   ],
   targets: [
@@ -49,6 +48,5 @@ let package = Package(
         .product(name: "DistributedCluster", package: "swift-distributed-actors"),
       ]
     ),
-  ],
-  swiftLanguageModes: [.v6]
+  ]
 )
