@@ -15,7 +15,5 @@ public typealias PersistenceID = String
 
 public protocol EventSourced: DistributedActor where ActorSystem == ClusterSystem {
   associatedtype Event: Codable & Sendable
-  distributed var persistenceID: PersistenceID { get }
-
   func handleEvent(_ event: Event)
 }

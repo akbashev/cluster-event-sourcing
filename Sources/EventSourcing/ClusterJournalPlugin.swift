@@ -1,57 +1,61 @@
 import Distributed
 import DistributedCluster
 
-/// Here magic should happen
 public actor ClusterJournalPlugin {
 
   private var actorSystem: ClusterSystem!
   private var store: AnyEventStore!
 
   private var factory: @Sendable (ClusterSystem) async throws -> (any EventStore)
-  private var emitContinuations: [PersistenceID: [CheckedContinuation<Void, Never>]] = [:]
-  private var restoringActorTasks: [PersistenceID: Task<Void, Never>] = [:]
+  private var emitTasks: [PersistenceID: Task<Void, any Error>] = [:]
+  private var registeredActors: [ClusterSystem.ActorID: PersistenceID] = [:]
 
-  public func emit<E: Codable & Sendable>(_ event: E, id persistenceId: PersistenceID) async throws {
-    if self.restoringActorTasks[persistenceId] != .none {
-      await withCheckedContinuation { continuation in
-        self.emitContinuations[persistenceId, default: []].append(continuation)
-      }
+  public enum RegistrationError: Error {
+    case notRegistered(ClusterSystem.ActorID)
+    case alreadyRegistered(ClusterSystem.ActorID, existingPersistenceID: PersistenceID)
+  }
+
+  public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID) async throws {
+    guard let persistenceId = self.registeredActors[id] else {
+      throw RegistrationError.notRegistered(id)
     }
-    // FIXME: When resuming work this is reentrant and could lead to some problems.
-    try await store.persistEvent(event, id: persistenceId)
+    if let emitTask = self.emitTasks[persistenceId] { try await emitTask.value }
+
+    let task = Task {
+      defer { self.emitTasks[persistenceId] = nil }
+      self.actorSystem.log.info("Emit event: \(event) for actor with id: \(persistenceId)")
+      try await store.persistEvent(event, id: persistenceId)
+    }
+    self.emitTasks[persistenceId] = task
+    return try await task.value
   }
 
   /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
-  public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) {
-    /// Checking if actor is already in restoring state
-    guard self.restoringActorTasks[persistenceId] == .none else { return }
-    self.restoringActorTasks[persistenceId] = Task { [weak actor] in
-      defer { self.removeTaskFor(id: persistenceId) }
-      do {
-        let events: [A.Event] = try await self.store.eventsFor(id: persistenceId)
-        await actor?.whenLocal { myself in
-          for event in events {
-            myself.handleEvent(event)
-          }
-        }
-      } catch {
-        self.actorSystem.log.error(
-          "Cluster journal haven't been able to restore state of an actor with id: \(persistenceId), reason: \(error)"
-        )
+  public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
+    let events: [A.Event] = try await self.store.eventsFor(id: persistenceId)
+    self.actorSystem.log.info("Restoring events \(events) of an actor with id: \(persistenceId)")
+    guard !Task.isCancelled else { return }
+    await actor.whenLocal { myself in
+      for event in events {
+        guard !Task.isCancelled else { return }
+        myself.handleEvent(event)
       }
     }
   }
 
-  private func finishContinuationsFor(
-    id: PersistenceID
-  ) {
-    for emit in (self.emitContinuations[id] ?? []) { emit.resume() }
-    self.emitContinuations.removeValue(forKey: id)
+  public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {
+    if let existing = self.registeredActors[actor.id] {
+      throw RegistrationError.alreadyRegistered(actor.id, existingPersistenceID: existing)
+    }
+    self.registeredActors[actor.id] = persistentId
+    try await self.restoreEventsFor(actor: actor, id: persistentId)
   }
 
-  private func removeTaskFor(id: PersistenceID) {
-    self.restoringActorTasks.removeValue(forKey: id)
-    self.finishContinuationsFor(id: id)
+  fileprivate func removeActorWith(id: ClusterSystem.ActorID) {
+    guard let persistenceId = self.registeredActors[id] else { return }
+    self.emitTasks[persistenceId]?.cancel()
+    self.emitTasks.removeValue(forKey: persistenceId)
+    self.registeredActors.removeValue(forKey: id)
   }
 
   public init(
@@ -81,26 +85,16 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
   public func stop(_ system: ClusterSystem) async {
     self.actorSystem = nil
     self.store = nil
-    for task in self.restoringActorTasks.values { task.cancel() }
-    for emit in self.emitContinuations.values.flatMap({ $0 }) { emit.resume() }
-    self.emitContinuations.removeAll()
   }
 
-  nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {
-    // FIXME: nonstructred, can we come up with something? 🤔
-    Task {
-      guard let eventSourced = actor as? (any EventSourced) else { return }
-      try await self.restoreEventsFor(actor: eventSourced, id: eventSourced.persistenceID)
+  nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {}
+
+  nonisolated public func onResignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
+    Task.immediate { [weak self] in
+      await self?.removeActorWith(id: id)
     }
   }
 
-  nonisolated public func onResignID(_ id: DistributedCluster.ClusterSystem.ActorID) {
-      // FIXME: Should we do something here?
-    //
-    //      Task {
-    //        self.removeTaskFor(id: id)
-    //      }
-  }
 }
 
 extension ClusterSystem {
@@ -118,7 +112,7 @@ extension EventSourced {
   // `whenLocal` is async atm, ideally should be non-async 🤔
   public func emit(event: Event) async throws {
     try await self.whenLocal { local in
-      try await self.actorSystem.journal.emit(event, id: self.persistenceID)
+      try await self.actorSystem.journal.emit(event, id: local.id)
       local.handleEvent(event)
     }
   }
@@ -130,11 +124,11 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
   private var store: any EventStore
 
   distributed func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID) async throws {
-    try await store.persistEvent(event, id: id)
+    try await self.store.persistEvent(event, id: id)
   }
 
   distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID) async throws -> [Event] {
-    try await store.eventsFor(id: id)
+    try await self.store.eventsFor(id: id)
   }
 
   init(

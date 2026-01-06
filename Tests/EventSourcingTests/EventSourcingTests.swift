@@ -26,14 +26,17 @@ struct EventSourcingTests {
       $0.swim.lifeguard.suspicionTimeoutMin = .milliseconds(500)
       $0.swim.lifeguard.suspicionTimeoutMax = .seconds(1)
     }
+
+    node.cluster.join(endpoint: node.cluster.endpoint)
+    try await node.cluster.joined(within: .seconds(3))
+
     let messages = ["hello", "test", "recovery"]
     var actor: TestActor?
     for i in 0..<2 {
-      actor = await TestActor(actorSystem: node)
+      actor = try await TestActor(actorSystem: node)
       try await actor?.send(message: messages[0])
       actor = .none
-      actor = await TestActor(actorSystem: node)
-      try await Task.sleep(for: .seconds(3))  // FIXME: Currently there is no guarantee in the system that actor will be restored properly
+      actor = try await TestActor(actorSystem: node)
       try await actor?.send(message: messages[1])
       try await actor?.send(message: messages[2])
       let actorMessages = try await actor?.getMessages() ?? []
@@ -52,12 +55,6 @@ struct EventSourcingTests {
       case message(String)
     }
 
-    distributed var persistenceID: PersistenceID {
-      _persistenceID
-    }
-
-    private var _persistenceID: PersistenceID
-
     var state: State = .init()
 
     distributed func send(message: String) async throws {
@@ -71,14 +68,16 @@ struct EventSourcingTests {
     distributed func handleEvent(_ event: Event) {
       switch event {
       case .message(let string):
-        self.actorSystem.log.debug(.init(stringLiteral: string))
+        self.actorSystem.log.info("Handle \(event)")
         self.state.messages.append(string)
       }
     }
 
-    init(actorSystem: ClusterSystem) async {
+    init(actorSystem: ClusterSystem) async throws {
       self.actorSystem = actorSystem
-      self._persistenceID = "test-actor"
+      try await actorSystem
+        .journal
+        .register(actor: self, with: "test-actor")
     }
   }
 }
@@ -98,7 +97,9 @@ actor MemoryEventStore: EventStore, Sendable {
     self.dict[id]?.compactMap(decoder.decode) ?? []
   }
 
-  func flush() { self.dict.removeAll() }
+  func flush() {
+    self.dict.removeAll()
+  }
 
   init(
     dict: [String: [Data]] = [:]

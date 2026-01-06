@@ -19,7 +19,7 @@ let node = await ClusterSystem("simple-node") {
 }
 ```
 
-3. Make distributed actor `EventSourced`. Provide `persistenceID` and define the `handleEvent(_:)` function:
+3. Make distributed actor `EventSourced` and define the `handleEvent(_:)` function. Register the actor with the journal in `init`:
 ```swift
 distributed actor SomeActor: EventSourced {
 
@@ -27,9 +27,6 @@ distributed actor SomeActor: EventSourced {
     enum Event {
         case doSomething 
     }
-    
-    // This is important to provide, events are stored per actor using persistenceID
-    distributed var persistenceID: PersistenceID { "some-actor" }
     
     distributed func doSomething() async throws {
         try await self.emit(event: .doSomething)
@@ -42,8 +39,9 @@ distributed actor SomeActor: EventSourced {
         }
     }
     
-    init(actorSystem: ClusterSystem) {
+    init(actorSystem: ClusterSystem, persistenceId: PersistenceID) async throws {
         self.actorSystem = actorSystem
+        try await actorSystem.journal.register(actor: self, with: persistenceId)
     }
 }
 ```
