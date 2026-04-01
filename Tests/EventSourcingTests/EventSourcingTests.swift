@@ -45,7 +45,8 @@ struct EventSourcingTests {
     }
   }
 
-  distributed actor TestActor: EventSourced {
+  @EventSourced
+  distributed actor TestActor {
 
     struct State {
       var messages: [String] = []
@@ -88,7 +89,7 @@ actor MemoryEventStore: EventStore, Sendable {
   private let encoder: JSONEncoder = JSONEncoder()
   private let decoder: JSONDecoder = JSONDecoder()
 
-  func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID) throws {
+  func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID, sequenceNumber: Int64) throws {
     let data = try encoder.encode(event)
     self.dict[id, default: []].append(data)
   }

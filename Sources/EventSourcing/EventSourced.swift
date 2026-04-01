@@ -1,6 +1,10 @@
 import Distributed
 import DistributedCluster
 
+@attached(member, names: named(sequenceNumber))
+@attached(extension, conformances: EventSourced)
+public macro EventSourced() = #externalMacro(module: "EventSourcingMacros", type: "EventSourcedMacro")
+
 /**
  This is a starting point to create some Event Sourcing with actors, thus very rudimentary.
 
@@ -15,5 +19,6 @@ public typealias PersistenceID = String
 
 public protocol EventSourced: DistributedActor where ActorSystem == ClusterSystem {
   associatedtype Event: Codable & Sendable
+  var sequenceNumber: Int64 { get set }
   func handleEvent(_ event: Event)
 }

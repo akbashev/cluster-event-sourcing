@@ -15,16 +15,18 @@ public actor ClusterJournalPlugin {
     case alreadyRegistered(ClusterSystem.ActorID, existingPersistenceID: PersistenceID)
   }
 
-  public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID) async throws {
+  public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID, sequenceNumber: Int64) async throws {
     guard let persistenceId = self.registeredActors[id] else {
       throw RegistrationError.notRegistered(id)
     }
-    if let emitTask = self.emitTasks[persistenceId] { try await emitTask.value }
 
-    let task = Task {
-      defer { self.emitTasks[persistenceId] = nil }
-      self.actorSystem.log.info("Emit event: \(event) for actor with id: \(persistenceId)")
-      try await store.persistEvent(event, id: persistenceId)
+    // Task chaining
+    let emitTask = self.emitTasks[persistenceId]
+    let task = Task { [emitTask] in
+      _ = try await emitTask?.value
+      guard !Task.isCancelled else { throw CancellationError() }
+      try await store.persistEvent(event, id: persistenceId, sequenceNumber: sequenceNumber)
+      self.actorSystem.log.info("Emitted event: \(event) for actor with id: \(persistenceId)")
     }
     self.emitTasks[persistenceId] = task
     return try await task.value
@@ -33,22 +35,23 @@ public actor ClusterJournalPlugin {
   /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
   public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
     let events: [A.Event] = try await self.store.eventsFor(id: persistenceId)
-    self.actorSystem.log.info("Restoring events \(events) of an actor with id: \(persistenceId)")
     guard !Task.isCancelled else { return }
-    await actor.whenLocal { myself in
+    await actor.whenLocal { local in
       for event in events {
         guard !Task.isCancelled else { return }
-        myself.handleEvent(event)
+        local.handleEvent(event)
+        local.sequenceNumber += 1
       }
     }
+    self.actorSystem.log.info("Restored events \(events) of an actor with id: \(persistenceId)")
   }
 
   public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {
     if let existing = self.registeredActors[actor.id] {
       throw RegistrationError.alreadyRegistered(actor.id, existingPersistenceID: existing)
     }
-    self.registeredActors[actor.id] = persistentId
     try await self.restoreEventsFor(actor: actor, id: persistentId)
+    self.registeredActors[actor.id] = persistentId
   }
 
   fileprivate func removeActorWith(id: ClusterSystem.ActorID) {
@@ -58,8 +61,16 @@ public actor ClusterJournalPlugin {
     self.registeredActors.removeValue(forKey: id)
   }
 
+  fileprivate func stopTasks() {
+    for task in self.emitTasks {
+      task.value.cancel()
+    }
+    self.emitTasks.removeAll()
+    self.registeredActors.removeAll()
+  }
+
   public init(
-    factory: @Sendable @escaping (ClusterSystem) -> any EventStore
+    factory: @Sendable @escaping (ClusterSystem) async throws -> any EventStore
   ) {
     self.factory = factory
   }
@@ -83,6 +94,7 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
   }
 
   public func stop(_ system: ClusterSystem) async {
+    self.stopTasks()
     self.actorSystem = nil
     self.store = nil
   }
@@ -112,8 +124,18 @@ extension EventSourced {
   // `whenLocal` is async atm, ideally should be non-async 🤔
   public func emit(event: Event) async throws {
     try await self.whenLocal { local in
-      try await self.actorSystem.journal.emit(event, id: local.id)
-      local.handleEvent(event)
+      local.sequenceNumber += 1
+      do {
+        try await self.actorSystem.journal.emit(
+          event,
+          id: local.id,
+          sequenceNumber: local.sequenceNumber
+        )
+        local.handleEvent(event)
+      } catch {
+        local.sequenceNumber -= 1
+        throw error
+      }
     }
   }
 }
@@ -123,8 +145,8 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
 
   private var store: any EventStore
 
-  distributed func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID) async throws {
-    try await self.store.persistEvent(event, id: id)
+  distributed func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID, sequenceNumber: Int64) async throws {
+    try await self.store.persistEvent(event, id: id, sequenceNumber: sequenceNumber)
   }
 
   distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID) async throws -> [Event] {
