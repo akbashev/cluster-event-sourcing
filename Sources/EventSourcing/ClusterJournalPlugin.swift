@@ -45,7 +45,14 @@ public actor ClusterJournalPlugin {
 
   /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
   public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
-    let events: [A.Event] = try await self.store.eventsFor(id: persistenceId)
+    // A restore may be called during shutdown, after `stop()` cleared the
+    // plugin's IUOs. Fail the activation loudly (never crash the process, and
+    // never let an actor come up believing it is current on an empty replay —
+    // the same shutdown race `emit` already guards against).
+    guard let store, let actorSystem else {
+      throw CancellationError()
+    }
+    let events: [A.Event] = try await store.eventsFor(id: persistenceId)
     guard !Task.isCancelled else { return }
     await actor.whenLocal { local in
       for event in events {
@@ -54,7 +61,7 @@ public actor ClusterJournalPlugin {
         local.sequenceNumber += 1
       }
     }
-    self.actorSystem.log.debug("Restored events \(events) of an actor with id: \(persistenceId)")
+    actorSystem.log.debug("Restored events \(events) of an actor with id: \(persistenceId)")
   }
 
   public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {
