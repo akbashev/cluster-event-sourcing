@@ -28,8 +28,13 @@ public actor ClusterJournalPlugin {
     // `registeredActors` guard above before reaching this point. Only the logger
     // is taken from the system so a late task does not keep the whole
     // ClusterSystem alive during shutdown.
-    let store: AnyEventStore = self.store
-    let log: Logger = self.actorSystem.log
+    // Post-stop emits pass the `registeredActors` guard above (stop does not
+    // clear it) and would unwrap the cleared IUOs — fail the emit loudly
+    // instead (same shutdown race as `restoreEventsFor`).
+    guard let store, let actorSystem else {
+      throw CancellationError()
+    }
+    let log: Logger = actorSystem.log
 
     // Task chaining
     let emitTask = self.emitTasks[persistenceId]
