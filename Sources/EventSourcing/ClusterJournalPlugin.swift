@@ -1,5 +1,6 @@
 import Distributed
 import DistributedCluster
+import Logging
 
 public actor ClusterJournalPlugin {
 
@@ -20,13 +21,23 @@ public actor ClusterJournalPlugin {
       throw RegistrationError.notRegistered(id)
     }
 
+    // Capture at enqueue time: this task may outlive `stop()`, which clears the
+    // plugin's IUOs. Unwrapping actor state at execution time crashes the process.
+    // The explicit annotations force-unwrap here, which is safe: `emit` is
+    // actor-isolated and serialized with `stop()`, and post-stop emits fail the
+    // `registeredActors` guard above before reaching this point. Only the logger
+    // is taken from the system so a late task does not keep the whole
+    // ClusterSystem alive during shutdown.
+    let store: AnyEventStore = self.store
+    let log: Logger = self.actorSystem.log
+
     // Task chaining
     let emitTask = self.emitTasks[persistenceId]
-    let task = Task { [emitTask] in
+    let task = Task { [emitTask, store, log] in
       _ = try await emitTask?.value
       guard !Task.isCancelled else { throw CancellationError() }
       try await store.persistEvent(event, id: persistenceId, sequenceNumber: sequenceNumber)
-      self.actorSystem.log.info("Emitted event: \(event) for actor with id: \(persistenceId)")
+      log.debug("Emitted event: \(event) for actor with id: \(persistenceId)")
     }
     self.emitTasks[persistenceId] = task
     return try await task.value
@@ -43,7 +54,7 @@ public actor ClusterJournalPlugin {
         local.sequenceNumber += 1
       }
     }
-    self.actorSystem.log.info("Restored events \(events) of an actor with id: \(persistenceId)")
+    self.actorSystem.log.debug("Restored events \(events) of an actor with id: \(persistenceId)")
   }
 
   public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {

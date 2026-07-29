@@ -69,7 +69,7 @@ struct EventSourcingTests {
     distributed func handleEvent(_ event: Event) {
       switch event {
       case .message(let string):
-        self.actorSystem.log.info("Handle \(event)")
+        self.actorSystem.log.debug("Handle \(event)")
         self.state.messages.append(string)
       }
     }
