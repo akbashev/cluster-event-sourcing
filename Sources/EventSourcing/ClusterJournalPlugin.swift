@@ -36,7 +36,22 @@ public actor ClusterJournalPlugin {
     }
     let log: Logger = actorSystem.log
 
-    // Task chaining
+    // Task chaining: each persist awaits the previous one, so events land in
+    // the store in emission order. Rethrowing the previous task's failure is
+    // DELIBERATE: once a persist fails, every later emit for this persistence
+    // ID fails too (without attempting a write), for two reasons:
+    //   1. Safety: a failed write is ambiguous — the event may actually have
+    //      been stored with its acknowledgement lost — so the journal can no
+    //      longer be trusted and must not silently accept new events.
+    //   2. Consistency under reentrancy: overlapping emits all fail and roll
+    //      back in lockstep, keeping `sequenceNumber`, live state and journal
+    //      in agreement (see `EventSourced.emit`).
+    // Recovery is the caller's responsibility: drop the actor — its ID
+    // resigning clears this chain (`removeActorWith`) — and re-`register`,
+    // which replays the journal and re-syncs state from it.
+    // NOTE: failure/retry/recovery semantics are intentionally minimal and
+    // will be revisited (planned after snapshotting). Do not "fix" the
+    // stickiness without designing that model first.
     let emitTask = self.emitTasks[persistenceId]
     let task = Task { [emitTask, store, log] in
       _ = try await emitTask?.value
@@ -145,6 +160,14 @@ extension ClusterSystem {
 
 extension EventSourced {
   // `whenLocal` is async atm, ideally should be non-async 🤔
+  /// Increments `sequenceNumber`, persists, and only then applies the event to
+  /// live state. On any failure the sequence number is rolled back and the
+  /// error rethrown — the actor never applies an event that didn't reach the
+  /// journal, and what to do next (retry, drop the actor, …) is the caller's
+  /// decision. Note that after a persist failure the journal refuses all
+  /// later emits for this persistence ID (see the task-chaining comment in
+  /// `ClusterJournalPlugin.emit`); the rollback stays consistent because
+  /// those cascading emits roll back too.
   public func emit(event: Event) async throws {
     try await self.whenLocal { local in
       local.sequenceNumber += 1
