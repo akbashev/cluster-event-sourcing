@@ -8,11 +8,15 @@ Don't store your actor's state—store the events that produced it. Every state 
 @EventSourced
 distributed actor OrderActor {
 
+  struct State: Codable, Sendable {
+    var items: [Item: Int] = [:]
+  }
+
   enum Event: Codable, Sendable {
     case itemAdded(item: Item, count: Int)
   }
 
-  private(set) var items: [Item: Int] = [:]
+  var state: State = .init()
 
   distributed func add(item: Item, count: Int) async throws {
     try await self.emit(event: .itemAdded(item: item, count: count))
@@ -21,7 +25,7 @@ distributed actor OrderActor {
   distributed func handleEvent(_ event: Event) {
     switch event {
     case .itemAdded(let item, let count):
-      items[item, default: 0] += count
+      state.items[item, default: 0] += count
     }
   }
 
@@ -65,23 +69,29 @@ protocol EventStore: Sendable {
   func persistEvent<Event: Codable & Sendable>(
     _ event: Event, id: String, sequenceNumber: Int64
   ) async throws
-  func eventsFor<Event: Codable & Sendable>(id: String) async throws -> [Event]
+  func eventsFor<Event: Codable & Sendable>(
+    id: String, fromSequenceNumber: Int64
+  ) async throws -> [Event]
 }
 ```
 
-`eventsFor(id:)` must return events in journal order—replay folds them in the order you return them.
+`eventsFor(id:fromSequenceNumber:)` must return events with `sequenceNumber >= fromSequenceNumber` in journal order—replay folds them in the order you return them. Sequence numbers are contiguous from 1, so `fromSequenceNumber: 1` reads the whole log (also available as the `eventsFor(id:)` extension convenience); larger values are what let snapshots skip replay.
 
-Declare the actor. The `@EventSourced` macro adds the `EventSourced` conformance and the `sequenceNumber` storage; you provide the `Event` type, `handleEvent(_:)`, and registration in `init`:
+Declare the actor. The `@EventSourced` macro adds the `EventSourced` conformance and the `sequenceNumber` storage; you provide the `Event` and `State` types, the `state` property, `handleEvent(_:)`, and registration in `init`:
 
 ```swift
 @EventSourced
 distributed actor OrderActor {
 
+  struct State: Codable, Sendable {
+    var items: [Item: Int] = [:]
+  }
+
   enum Event: Codable, Sendable {
     case itemAdded(item: Item, count: Int)
   }
 
-  private(set) var items: [Item: Int] = [:]
+  var state: State = .init()
 
   distributed func add(item: Item, count: Int) async throws {
     try await self.emit(event: .itemAdded(item: item, count: count))
@@ -90,7 +100,7 @@ distributed actor OrderActor {
   distributed func handleEvent(_ event: Event) {
     switch event {
     case .itemAdded(let item, let count):
-      items[item, default: 0] += count
+      state.items[item, default: 0] += count
     }
   }
 
@@ -120,7 +130,7 @@ extension OrderActor: EventSourced {}
 3. Only after the persist succeeds is `handleEvent(_:)` applied to live state. A failed persist rolls the sequence number back and rethrows: the actor never applies an event that didn't reach the journal.
 4. **A persist failure is sticky.** Once a persist fails, every later emit for that persistence ID fails too—without attempting a write—because the journal can no longer be trusted (the failed write may actually have landed, with its acknowledgement lost). What to do next is the caller's decision; the recovery path is to drop the actor (its ID resigning clears the journal chain) and re-`register`, which replays the journal and re-syncs state from it.
 
-`register(actor:with:)` (called in `init`) loads `eventsFor(id:)` and replays each event through the same `handleEvent(_:)`, counting the sequence number up as it goes. After registration the actor is current and further `emit`s continue the sequence. Registering the same actor twice throws `RegistrationError.alreadyRegistered`; emitting on an unregistered actor throws `RegistrationError.notRegistered`.
+`register(actor:with:)` (called in `init`) restores the actor before it serves calls: if a snapshot store is configured and holds a decodable snapshot, its state and covered sequence number are adopted directly, then only the events after it are folded through the same `handleEvent(_:)`—otherwise the whole journal is replayed, counting the sequence number up as it goes. After registration the actor is current and further `emit`s continue the sequence. Registering the same actor twice throws `RegistrationError.alreadyRegistered`; emitting on an unregistered actor throws `RegistrationError.notRegistered`.
 
 Access the journal from anywhere via the system:
 
@@ -128,10 +138,73 @@ Access the journal from anywhere via the system:
 system.journal  // the installed ClusterJournalPlugin
 ```
 
+## Snapshotting
+
+Replaying a long journal on every activation gets expensive. Snapshotting checkpoints `state` every Nth event so recovery folds only the tail. Snapshots live in a **separate store**—the event store holds the event log and nothing else:
+
+```swift
+let system = await ClusterSystem("my-node") {
+  $0.plugins.install(plugin: ClusterSingletonPlugin())
+  $0.plugins.install(
+    plugin: ClusterJournalPlugin(
+      factory: { _ in PostgresEventStore() },
+      snapshotFactory: { _ in PostgresSnapshotStore() }  // optional
+    )
+  )
+}
+```
+
+All persistent state must live behind the `state` property—snapshots are taken from and restored into it (transient state can use separate properties outside):
+
+```swift
+@EventSourced
+distributed actor OrderActor {
+
+  struct State: Codable, Sendable {
+    var items: [Item: Int] = [:]
+  }
+
+  var state: State = .init()
+
+  // Snapshot cadence is a property of the entity type, declared in code so
+  // the policy travels with it across nodes. Defaults to .disabled.
+  let snapshotting: Snapshotting = .enabled(every: 100)
+
+  // ... Event, handleEvent, init as before — nothing else changes
+}
+```
+
+With `.enabled(every: N)`, each `emit` whose sequence number is a multiple of N saves a snapshot of the post-event state. Implement `SnapshotStore` to store them:
+
+```swift
+protocol SnapshotStore: Sendable {
+  func save<State: Codable & Sendable>(
+    _ state: State, id: PersistenceID, coveredSequenceNumber: Int64
+  ) async throws
+  func latestSnapshot<State: Codable & Sendable>(
+    id: PersistenceID
+  ) async throws -> Snapshot<State>?
+}
+```
+
+Contract, in brief:
+
+- **Monotonic per ID.** Re-saving the same `coveredSequenceNumber` is a no-op; a lower one is ignored (racing actor incarnations may save out of order). `latestSnapshot` returns the highest covered.
+- **Tolerant decode.** A snapshot that no longer decodes after a `State` schema change is treated as absent—the journal falls back to full replay rather than failing.
+- **Encoding is the store's business**, as with events.
+- **Retention is store-internal**—keep the latest, or keep N for forensics.
+
+Snapshotting never enters the failure semantics:
+
+- A failed snapshot **save** is logged and journaling continues (compare Akka's `SnapshotFailed`)—the next cadence boundary tries again.
+- `.enabled` with **no snapshot store configured** degrades the same way: a warning at each cadence boundary, journaling unaffected.
+- A snapshot that fails to **load** falls back to full replay. The journal is always the source of truth; snapshots only shorten recovery.
+- Mixed clusters are fine—one node `.enabled`, another `.disabled`, or different cadences only change snapshot density, never outcomes.
+
 ## Notes and caveats
 
-- **Failure semantics are deliberately minimal.** Persist failures propagate to the caller and freeze writes for that persistence ID (see point 4 above); there is no built-in retry, backoff, or automatic replay-on-failure. This model is a placeholder by design and will be revisited after snapshotting lands—expect the failure/recovery API to evolve.
-- **Full replay, no snapshotting.** Recovery replays the entire journal. Long-lived actors with large journals pay that cost on every activation; compacting snapshots are your store's business if you need them.
+- **Failure semantics are deliberately minimal.** Persist failures propagate to the caller and freeze writes for that persistence ID (see point 4 above); there is no built-in retry, backoff, or automatic replay-on-failure. This model is a placeholder by design and will be revisited—expect the failure/recovery API to evolve.
+- **Replay cost is tunable, not zero.** Without snapshots, recovery replays the entire journal on every activation; `.enabled(every:)` bounds it to the tail after the latest snapshot.
 - **Events are forever.** A journal is an append-only log of `Codable` events—evolve event types additively, or version them in your store's decoding.
 - **`emit` is local.** It requires the actor instance (`whenLocal`); remote callers go through distributed methods that emit on the hosting node.
 - **Lifecycle is managed.** The journal drops an actor's registration when its ID resigns, and refuses emits/restores after the plugin stops (failing loudly with `CancellationError` rather than crashing on shutdown races).

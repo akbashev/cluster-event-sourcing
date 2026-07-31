@@ -6,14 +6,22 @@ public actor ClusterJournalPlugin {
 
   private var actorSystem: ClusterSystem!
   private var store: AnyEventStore!
+  private var snapshotStore: AnySnapshotStore!
 
   private var factory: @Sendable (ClusterSystem) async throws -> (any EventStore)
+  private var snapshotFactory: (@Sendable (ClusterSystem) async throws -> any SnapshotStore)?
   private var emitTasks: [PersistenceID: Task<Void, any Error>] = [:]
   private var registeredActors: [ClusterSystem.ActorID: PersistenceID] = [:]
 
   public enum RegistrationError: Error {
     case notRegistered(ClusterSystem.ActorID)
     case alreadyRegistered(ClusterSystem.ActorID, existingPersistenceID: PersistenceID)
+  }
+
+  public enum SnapshottingError: Error {
+    /// Snapshotting is enabled on the entity but the plugin was created
+    /// without a snapshot store factory.
+    case storeNotConfigured
   }
 
   public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID, sequenceNumber: Int64) async throws {
@@ -63,6 +71,24 @@ public actor ClusterJournalPlugin {
     return try await task.value
   }
 
+  /// Best-effort snapshot save: the event log is complete without it, so a
+  /// failure here is logged by the caller and never fails the emit (compare
+  /// Akka's non-fatal `SnapshotFailed` signal). Monotonicity and retention
+  /// are the store's business — see `SnapshotStore`.
+  public func saveSnapshot<State: Codable & Sendable>(
+    _ state: State,
+    id: ClusterSystem.ActorID,
+    coveredSequenceNumber: Int64
+  ) async throws {
+    guard let persistenceId = self.registeredActors[id] else {
+      throw RegistrationError.notRegistered(id)
+    }
+    guard let snapshotStore else {
+      throw SnapshottingError.storeNotConfigured
+    }
+    try await snapshotStore.save(state, id: persistenceId, coveredSequenceNumber: coveredSequenceNumber)
+  }
+
   /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
   public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
     // A restore may be called during shutdown, after `stop()` cleared the
@@ -72,16 +98,37 @@ public actor ClusterJournalPlugin {
     guard let store, let actorSystem else {
       throw CancellationError()
     }
-    let events: [A.Event] = try await store.eventsFor(id: persistenceId)
-    guard !Task.isCancelled else { return }
-    await actor.whenLocal { local in
+
+    // Phase 1: restore from the latest snapshot if one is available. A
+    // snapshot that cannot be loaded (store down, undecodable after a State
+    // schema change) falls back to full replay — the log is complete.
+    var fromSequenceNumber: Int64 = 1
+    if let snapshotStore,
+      let snapshot: Snapshot<A.State> = try? await snapshotStore.latestSnapshot(id: persistenceId)
+    {
+      await actor.whenLocal { local in
+        local.state = snapshot.state
+        local.sequenceNumber = snapshot.coveredSequenceNumber
+      }
+      fromSequenceNumber = snapshot.coveredSequenceNumber + 1
+    }
+
+    // Phase 2: fold the suffix.
+    let events: [A.Event] = try await store.eventsFor(id: persistenceId, fromSequenceNumber: fromSequenceNumber)
+    _ = try await actor.whenLocal { local in
       for event in events {
-        guard !Task.isCancelled else { return }
+        // A cancelled activation must fail loudly, never come up stale: after
+        // a snapshot restore the sequence number is already advanced, so
+        // silently skipping the fold would register the actor as current
+        // while it is behind the journal.
+        if Task.isCancelled { throw CancellationError() }
         local.handleEvent(event)
         local.sequenceNumber += 1
       }
     }
-    actorSystem.log.debug("Restored events \(events) of an actor with id: \(persistenceId)")
+    actorSystem.log.debug(
+      "Restored actor with id: \(persistenceId) from sequence number \(fromSequenceNumber), applied \(events.count) events"
+    )
   }
 
   public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {
@@ -108,9 +155,11 @@ public actor ClusterJournalPlugin {
   }
 
   public init(
-    factory: @Sendable @escaping (ClusterSystem) async throws -> any EventStore
+    factory: @Sendable @escaping (ClusterSystem) async throws -> any EventStore,
+    snapshotFactory: (@Sendable (ClusterSystem) async throws -> any SnapshotStore)? = nil
   ) {
     self.factory = factory
+    self.snapshotFactory = snapshotFactory
   }
 }
 
@@ -129,12 +178,21 @@ extension ClusterJournalPlugin: ActorLifecyclePlugin {
       .host(name: "\(ClusterJournalPlugin.pluginKey)_store") {
         try await AnyEventStore(actorSystem: $0, store: self.factory($0))
       }
+    if let snapshotFactory = self.snapshotFactory {
+      self.snapshotStore =
+        try await system
+        .singleton
+        .host(name: "\(ClusterJournalPlugin.pluginKey)_snapshots") {
+          try await AnySnapshotStore(actorSystem: $0, store: snapshotFactory($0))
+        }
+    }
   }
 
   public func stop(_ system: ClusterSystem) async {
     self.stopTasks()
     self.actorSystem = nil
     self.store = nil
+    self.snapshotStore = nil
   }
 
   nonisolated public func onActorReady<Act: DistributedActor>(_ actor: Act) where Act.ID == ClusterSystem.ActorID {}
@@ -160,14 +218,20 @@ extension ClusterSystem {
 
 extension EventSourced {
   // `whenLocal` is async atm, ideally should be non-async 🤔
-  /// Increments `sequenceNumber`, persists, and only then applies the event to
-  /// live state. On any failure the sequence number is rolled back and the
+  /// Increments `sequenceNumber`, persists the event, and only then applies it
+  /// to live state. On any failure the sequence number is rolled back and the
   /// error rethrown — the actor never applies an event that didn't reach the
   /// journal, and what to do next (retry, drop the actor, …) is the caller's
   /// decision. Note that after a persist failure the journal refuses all
   /// later emits for this persistence ID (see the task-chaining comment in
-  /// `ClusterJournalPlugin.emit`); the rollback stays consistent because
-  /// those cascading emits roll back too.
+  /// `ClusterJournalPlugin.emit`); the rollback stays consistent because those
+  /// cascading emits roll back too.
+  ///
+  /// Snapshotting (see `snapshotting`): every Nth successful emit also saves a
+  /// snapshot of the post-event state, covering that sequence number. The save
+  /// is BEST-EFFORT — the event log is complete without it, so a failure is
+  /// logged and never fails the emit (compare Akka's non-fatal
+  /// `SnapshotFailed` signal).
   public func emit(event: Event) async throws {
     try await self.whenLocal { local in
       local.sequenceNumber += 1
@@ -182,6 +246,23 @@ extension EventSourced {
         local.sequenceNumber -= 1
         throw error
       }
+
+      if case .enabled(let every) = local.snapshotting,
+        every > 0,
+        local.sequenceNumber % Int64(every) == 0
+      {
+        do {
+          try await self.actorSystem.journal.saveSnapshot(
+            local.state,
+            id: local.id,
+            coveredSequenceNumber: local.sequenceNumber
+          )
+        } catch {
+          self.actorSystem.log.warning(
+            "Snapshot save failed for actor with id: \(local.id) at sequence number \(local.sequenceNumber): \(error)"
+          )
+        }
+      }
     }
   }
 }
@@ -195,13 +276,35 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
     try await self.store.persistEvent(event, id: id, sequenceNumber: sequenceNumber)
   }
 
-  distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID) async throws -> [Event] {
-    try await self.store.eventsFor(id: id)
+  distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID, fromSequenceNumber: Int64) async throws -> [Event] {
+    try await self.store.eventsFor(id: id, fromSequenceNumber: fromSequenceNumber)
   }
 
   init(
     actorSystem: ActorSystem,
     store: any EventStore
+  ) {
+    self.actorSystem = actorSystem
+    self.store = store
+  }
+}
+
+/// Same wrapping as `AnyEventStore`, for the optional snapshot store.
+distributed actor AnySnapshotStore: SnapshotStore, ClusterSingleton {
+
+  private var store: any SnapshotStore
+
+  distributed func save<State: Codable & Sendable>(_ state: State, id: PersistenceID, coveredSequenceNumber: Int64) async throws {
+    try await self.store.save(state, id: id, coveredSequenceNumber: coveredSequenceNumber)
+  }
+
+  distributed func latestSnapshot<State: Codable & Sendable>(id: PersistenceID) async throws -> Snapshot<State>? {
+    try await self.store.latestSnapshot(id: id)
+  }
+
+  init(
+    actorSystem: ActorSystem,
+    store: any SnapshotStore
   ) {
     self.actorSystem = actorSystem
     self.store = store
