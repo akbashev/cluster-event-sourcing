@@ -11,6 +11,32 @@ public struct Snapshot<State: Codable & Sendable>: Codable, Sendable {
   }
 }
 
+/// Sequence-number bounds used when loading or deleting snapshots. This is
+/// the sequence-based subset of Akka Persistence's
+/// `SnapshotSelectionCriteria`; timestamp bounds can be added when snapshot
+/// metadata gains timestamps.
+public struct SnapshotSelectionCriteria: Codable, Equatable, Sendable {
+  public let minSequenceNumber: Int64?
+  public let maxSequenceNumber: Int64?
+
+  public init(
+    minSequenceNumber: Int64? = nil,
+    maxSequenceNumber: Int64? = nil
+  ) {
+    self.minSequenceNumber = minSequenceNumber
+    self.maxSequenceNumber = maxSequenceNumber
+  }
+
+  public static func through(_ sequenceNumber: Int64) -> Self {
+    .init(maxSequenceNumber: sequenceNumber)
+  }
+
+  public func includes(_ sequenceNumber: Int64) -> Bool {
+    (self.minSequenceNumber.map { sequenceNumber >= $0 } ?? true)
+      && (self.maxSequenceNumber.map { sequenceNumber <= $0 } ?? true)
+  }
+}
+
 /// Storage for actor state snapshots — an OPTIONAL add-on next to the
 /// `EventStore` (which holds the event log and nothing else). The system is
 /// fully functional without a snapshot store: entities journal and replay
@@ -34,11 +60,18 @@ public protocol SnapshotStore: Sendable {
     coveredSequenceNumber: Int64
   ) async throws
 
+  /// Delete all snapshots for `id` matching the supplied sequence bounds.
+  /// Retention policy is owned by the journal layer; stores only execute the
+  /// resulting criteria-based deletion.
+  func deleteSnapshots(
+    id: PersistenceID,
+    matching criteria: SnapshotSelectionCriteria
+  ) async throws
+
   /// The snapshot with the highest covered sequence number, or nil.
   ///
-  /// Retention (keep latest, keep N) is store-internal. Tolerant decode is
-  /// expected as with events: a snapshot that no longer decodes after a
-  /// `State` schema change should be treated as absent (nil) rather than
-  /// failing the read — the journal then falls back to full replay.
+  /// Tolerant decode is expected as with events: a snapshot that no longer
+  /// decodes after a `State` schema change should be treated as absent (nil)
+  /// rather than failing the read — the journal then falls back to full replay.
   func latestSnapshot<State: Codable & Sendable>(id: PersistenceID) async throws -> Snapshot<State>?
 }

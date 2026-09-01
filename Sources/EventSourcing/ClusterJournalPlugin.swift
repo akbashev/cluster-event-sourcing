@@ -22,6 +22,8 @@ public actor ClusterJournalPlugin {
     /// Snapshotting is enabled on the entity but the plugin was created
     /// without a snapshot store factory.
     case storeNotConfigured
+    /// `.keepLast` requires a positive snapshot count.
+    case invalidRetentionCount(Int)
   }
 
   public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID, sequenceNumber: Int64) async throws {
@@ -71,14 +73,15 @@ public actor ClusterJournalPlugin {
     return try await task.value
   }
 
-  /// Best-effort snapshot save: the event log is complete without it, so a
-  /// failure here is logged by the caller and never fails the emit (compare
-  /// Akka's non-fatal `SnapshotFailed` signal). Monotonicity and retention
-  /// are the store's business — see `SnapshotStore`.
+  /// Best-effort snapshot save and retention: the event log is complete
+  /// without either, so a failure here is logged by the caller and never fails
+  /// the emit (compare Akka's non-fatal snapshot and deletion signals).
   public func saveSnapshot<State: Codable & Sendable>(
     _ state: State,
     id: ClusterSystem.ActorID,
-    coveredSequenceNumber: Int64
+    coveredSequenceNumber: Int64,
+    retention: RetentionCriteria,
+    periodicSnapshotEvery: Int?
   ) async throws {
     guard let persistenceId = self.registeredActors[id] else {
       throw RegistrationError.notRegistered(id)
@@ -86,11 +89,29 @@ public actor ClusterJournalPlugin {
     guard let snapshotStore else {
       throw SnapshottingError.storeNotConfigured
     }
+    if case .keepLast(let count) = retention, count < 1 {
+      throw SnapshottingError.invalidRetentionCount(count)
+    }
     try await snapshotStore.save(state, id: persistenceId, coveredSequenceNumber: coveredSequenceNumber)
+    if case .keepLast(let count) = retention,
+      let numberOfEvents = periodicSnapshotEvery,
+      let interval = Int64(exactly: numberOfEvents)
+    {
+      let (distance, overflowed) = interval.multipliedReportingOverflow(by: Int64(count))
+      let (cutoff, underflowed) = coveredSequenceNumber.subtractingReportingOverflow(distance)
+      if !overflowed, !underflowed, cutoff >= 1 {
+        try await snapshotStore.deleteSnapshots(
+          id: persistenceId,
+          matching: .through(cutoff)
+        )
+      }
+    }
   }
 
   /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
   public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
+    try Task.checkCancellation()
+
     // A restore may be called during shutdown, after `stop()` cleared the
     // plugin's IUOs. Fail the activation loudly (never crash the process, and
     // never let an actor come up believing it is current on an empty replay —
@@ -112,22 +133,44 @@ public actor ClusterJournalPlugin {
       }
       fromSequenceNumber = snapshot.coveredSequenceNumber + 1
     }
+    try Task.checkCancellation()
 
-    // Phase 2: fold the suffix.
-    let events: [A.Event] = try await store.eventsFor(id: persistenceId, fromSequenceNumber: fromSequenceNumber)
-    _ = try await actor.whenLocal { local in
-      for event in events {
-        // A cancelled activation must fail loudly, never come up stale: after
-        // a snapshot restore the sequence number is already advanced, so
-        // silently skipping the fold would register the actor as current
-        // while it is behind the journal.
-        if Task.isCancelled { throw CancellationError() }
-        local.handleEvent(event)
-        local.sequenceNumber += 1
+    // Phase 2: ask the store singleton to push replay envelopes to a temporary
+    // local receiver. This mirrors Akka's ReplayMessages/ReplayedMessage flow:
+    // the stream stays local to the store and each receiver invocation applies
+    // one event before acknowledging it, providing natural backpressure.
+    let replayFromSequenceNumber = fromSequenceNumber
+    let receiver = EventReplayReceiver<A.Event>(actorSystem: actorSystem) { envelope in
+      guard
+        try await actor.whenLocal({ local in
+          // A cancelled activation must fail loudly, never come up stale: after
+          // a snapshot restore the sequence number is already advanced, so
+          // silently skipping the fold would register the actor as current
+          // while it is behind the journal.
+          if Task.isCancelled { throw CancellationError() }
+          local.handleEvent(envelope.event)
+          local.sequenceNumber = envelope.sequenceNumber
+          return true
+        }) == true
+      else {
+        throw CancellationError()
       }
     }
+    try await store.replay(
+      id: persistenceId,
+      fromSequenceNumber: fromSequenceNumber,
+      receiver: receiver
+    )
+    try Task.checkCancellation()
+    let recoveredSequenceNumber = await actor.whenLocal { local in
+      local.sequenceNumber
+    }
+    let appliedEvents =
+      recoveredSequenceNumber.map {
+        max(0, $0 - replayFromSequenceNumber + 1)
+      } ?? 0
     actorSystem.log.debug(
-      "Restored actor with id: \(persistenceId) from sequence number \(fromSequenceNumber), applied \(events.count) events"
+      "Restored actor with id: \(persistenceId), applied \(appliedEvents) events"
     )
   }
 
@@ -227,9 +270,11 @@ extension EventSourced {
   /// `ClusterJournalPlugin.emit`); the rollback stays consistent because those
   /// cascading emits roll back too.
   ///
-  /// Snapshotting (see `snapshotting`): every Nth successful emit also saves a
-  /// snapshot of the post-event state, covering that sequence number. The save
-  /// is BEST-EFFORT — the event log is complete without it, so a failure is
+  /// Snapshotting (see `snapshotting`): a successful emit also saves a
+  /// snapshot of the post-event state when the policy says so — every Nth
+  /// event for `.every`, whenever the rule returns true for `.when`, or when
+  /// either condition matches for `.every(..., orWhen:)`. The save is
+  /// BEST-EFFORT — the event log is complete without it, so a failure is
   /// logged and never fails the emit (compare Akka's non-fatal
   /// `SnapshotFailed` signal).
   public func emit(event: Event) async throws {
@@ -247,19 +292,38 @@ extension EventSourced {
         throw error
       }
 
-      if case .enabled(let every) = local.snapshotting,
-        every > 0,
-        local.sequenceNumber % Int64(every) == 0
-      {
+      let snapshotRequest: (retention: RetentionCriteria, periodicSnapshotEvery: Int?)?
+      switch local.snapshotting {
+      case .disabled:
+        snapshotRequest = nil
+      case .every(let numberOfEvents, let configuredRetention, let rule):
+        let isPeriodic =
+          numberOfEvents > 0 && local.sequenceNumber % Int64(numberOfEvents) == 0
+        if isPeriodic {
+          snapshotRequest = (configuredRetention, numberOfEvents)
+        } else if rule?(event, local.state, local.sequenceNumber) == true {
+          snapshotRequest = (.keepAll, nil)
+        } else {
+          snapshotRequest = nil
+        }
+      case .when(let rule):
+        snapshotRequest =
+          rule(event, local.state, local.sequenceNumber)
+          ? (.keepAll, nil)
+          : nil
+      }
+      if let snapshotRequest {
         do {
           try await self.actorSystem.journal.saveSnapshot(
             local.state,
             id: local.id,
-            coveredSequenceNumber: local.sequenceNumber
+            coveredSequenceNumber: local.sequenceNumber,
+            retention: snapshotRequest.retention,
+            periodicSnapshotEvery: snapshotRequest.periodicSnapshotEvery
           )
         } catch {
           self.actorSystem.log.warning(
-            "Snapshot save failed for actor with id: \(local.id) at sequence number \(local.sequenceNumber): \(error)"
+            "Snapshot save or retention cleanup failed for actor with id: \(local.id) at sequence number \(local.sequenceNumber): \(error)"
           )
         }
       }
@@ -267,8 +331,16 @@ extension EventSourced {
   }
 }
 
-/// Not sure if it's correct way, basically wrapping `any EventStore` into `AnyEventStore` which is singleton
-distributed actor AnyEventStore: EventStore, ClusterSingleton {
+/// Not sure if it's correct way, basically wrapping `any EventStore` into `AnyEventStore` which is singleton.
+/// Deliberately NOT an `EventStore`: a distributed actor may only satisfy
+/// protocol requirements with `distributed` witnesses, and `eventStream`
+/// cannot be distributed (streams don't cross the wire) — so this wrapper
+/// pushes replay envelopes to a temporary receiver because streams cannot
+/// cross the distributed-actor boundary. Local streaming consumers should use
+/// the concrete store (or `any EventStore`) directly. Across nodes, this is one
+/// acknowledged distributed call per envelope; long journals may eventually
+/// need an internal batched transport while preserving this streaming API.
+distributed actor AnyEventStore: ClusterSingleton {
 
   private var store: any EventStore
 
@@ -276,8 +348,18 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
     try await self.store.persistEvent(event, id: id, sequenceNumber: sequenceNumber)
   }
 
-  distributed func eventsFor<Event: Codable & Sendable>(id: PersistenceID, fromSequenceNumber: Int64) async throws -> [Event] {
-    try await self.store.eventsFor(id: id, fromSequenceNumber: fromSequenceNumber)
+  distributed func replay<Event: Codable & Sendable>(
+    id: PersistenceID,
+    fromSequenceNumber: Int64,
+    receiver: EventReplayReceiver<Event>
+  ) async throws {
+    let stream: EventStream<Event> = try await self.store.eventStream(
+      id: id,
+      fromSequenceNumber: fromSequenceNumber
+    )
+    for try await envelope in stream {
+      try await receiver.replay(envelope)
+    }
   }
 
   init(
@@ -286,6 +368,27 @@ distributed actor AnyEventStore: EventStore, ClusterSingleton {
   ) {
     self.actorSystem = actorSystem
     self.store = store
+  }
+}
+
+/// Temporary endpoint for one recovery. `AnyEventStore` pushes envelopes into
+/// it one at a time; a push is not acknowledged until `consume` returns.
+distributed actor EventReplayReceiver<Event: Codable & Sendable> {
+
+  typealias ActorSystem = ClusterSystem
+
+  private let consume: @Sendable (EventEnvelope<Event>) async throws -> Void
+
+  distributed func replay(_ envelope: EventEnvelope<Event>) async throws {
+    try await self.consume(envelope)
+  }
+
+  init(
+    actorSystem: ClusterSystem,
+    consume: @escaping @Sendable (EventEnvelope<Event>) async throws -> Void
+  ) {
+    self.actorSystem = actorSystem
+    self.consume = consume
   }
 }
 
@@ -300,6 +403,13 @@ distributed actor AnySnapshotStore: SnapshotStore, ClusterSingleton {
 
   distributed func latestSnapshot<State: Codable & Sendable>(id: PersistenceID) async throws -> Snapshot<State>? {
     try await self.store.latestSnapshot(id: id)
+  }
+
+  distributed func deleteSnapshots(
+    id: PersistenceID,
+    matching criteria: SnapshotSelectionCriteria
+  ) async throws {
+    try await self.store.deleteSnapshots(id: id, matching: criteria)
   }
 
   init(

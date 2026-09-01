@@ -47,20 +47,25 @@ distributed actor OrderActor {
 
 ## Quick start
 
-Install the plugins (order matters—the journal hosts its store as a cluster singleton):
+Create your store and install the plugins (order matters—the journal hosts its
+store as a cluster singleton):
 
 ```swift
+let eventStore = MyEventStore()
+
 let system = await ClusterSystem("my-node") {
   $0.plugins.install(plugin: ClusterSingletonPlugin())
   $0.plugins.install(
     plugin: ClusterJournalPlugin { _ in
-      PostgresEventStore()  // your EventStore
+      eventStore
     }
   )
 }
 ```
 
 The factory is `@Sendable (ClusterSystem) async throws -> any EventStore`, so store setup can itself be asynchronous.
+For a concrete PostgreSQL event and snapshot store, see
+[postgres-event-store](https://github.com/akbashev/postgres-event-store).
 
 Implement `EventStore`:
 
@@ -69,13 +74,13 @@ protocol EventStore: Sendable {
   func persistEvent<Event: Codable & Sendable>(
     _ event: Event, id: String, sequenceNumber: Int64
   ) async throws
-  func eventsFor<Event: Codable & Sendable>(
+  func eventStream<Event: Codable & Sendable>(
     id: String, fromSequenceNumber: Int64
-  ) async throws -> [Event]
+  ) async throws -> EventStream<Event>
 }
 ```
 
-`eventsFor(id:fromSequenceNumber:)` must return events with `sequenceNumber >= fromSequenceNumber` in journal order—replay folds them in the order you return them. Sequence numbers are contiguous from 1, so `fromSequenceNumber: 1` reads the whole log (also available as the `eventsFor(id:)` extension convenience); larger values are what let snapshots skip replay.
+`eventStream(id:fromSequenceNumber:)` must stream events with `sequenceNumber >= fromSequenceNumber` in journal order. Sequence numbers are contiguous from 1; larger starting values let snapshots skip replay. Local consumers use the stream directly. During recovery, the distributed store pushes envelopes one at a time to a temporary receiver and waits for each application to finish, providing backpressure without buffering the complete journal suffix.
 
 Declare the actor. The `@EventSourced` macro adds the `EventSourced` conformance and the `sequenceNumber` storage; you provide the `Event` and `State` types, the `state` property, `handleEvent(_:)`, and registration in `init`:
 
@@ -143,12 +148,15 @@ system.journal  // the installed ClusterJournalPlugin
 Replaying a long journal on every activation gets expensive. Snapshotting checkpoints `state` every Nth event so recovery folds only the tail. Snapshots live in a **separate store**—the event store holds the event log and nothing else:
 
 ```swift
+let eventStore = MyEventStore()
+let snapshotStore = MySnapshotStore()
+
 let system = await ClusterSystem("my-node") {
   $0.plugins.install(plugin: ClusterSingletonPlugin())
   $0.plugins.install(
     plugin: ClusterJournalPlugin(
-      factory: { _ in PostgresEventStore() },
-      snapshotFactory: { _ in PostgresSnapshotStore() }  // optional
+      factory: { _ in eventStore },
+      snapshotFactory: { _ in snapshotStore }  // optional
     )
   )
 }
@@ -168,13 +176,42 @@ distributed actor OrderActor {
 
   // Snapshot cadence is a property of the entity type, declared in code so
   // the policy travels with it across nodes. Defaults to .disabled.
-  let snapshotting: Snapshotting = .enabled(every: 100)
+  let snapshotting: Snapshotting<Event, State> = .every(
+    numberOfEvents: 100,
+    retention: .keepLast(2)
+  )
 
   // ... Event, handleEvent, init as before — nothing else changes
 }
 ```
 
-With `.enabled(every: N)`, each `emit` whose sequence number is a multiple of N saves a snapshot of the post-event state. Implement `SnapshotStore` to store them:
+With `.every(numberOfEvents:retention:)`, each `emit` whose sequence number is a multiple of N saves a snapshot of the post-event state. Retention defaults to `.keepAll`; `.keepLast(N)` deletes snapshots below the cadence-derived sequence-number cutoff after a successful periodic save. For domain-meaningful timing instead of a fixed cadence, `.when` evaluates a rule with the just-applied event, the post-event state, and its sequence number. As in Akka, predicate-triggered snapshots do not initiate retention cleanup.
+
+```swift
+// Snapshot right after a compaction event shrank the state — the cheapest
+// possible snapshot, covering the longest prefix.
+let snapshotting: Snapshotting<Event, State> = .when { event, _, _ in
+  if case .compacted = event { return true }
+  return false
+}
+```
+
+When both triggers are useful, add `orWhen` to the periodic factory. A snapshot
+is saved when either condition matches, but retention cleanup runs only when
+the periodic cadence matches:
+
+```swift
+let snapshotting: Snapshotting<Event, State> = .every(
+  numberOfEvents: 100,
+  retention: .keepLast(2),
+  orWhen: { event, _, _ in
+    if case .compacted = event { return true }
+    return false
+  }
+)
+```
+
+Implement `SnapshotStore` to store them:
 
 ```swift
 protocol SnapshotStore: Sendable {
@@ -184,6 +221,9 @@ protocol SnapshotStore: Sendable {
   func latestSnapshot<State: Codable & Sendable>(
     id: PersistenceID
   ) async throws -> Snapshot<State>?
+  func deleteSnapshots(
+    id: PersistenceID, matching criteria: SnapshotSelectionCriteria
+  ) async throws
 }
 ```
 
@@ -192,19 +232,20 @@ Contract, in brief:
 - **Monotonic per ID.** Re-saving the same `coveredSequenceNumber` is a no-op; a lower one is ignored (racing actor incarnations may save out of order). `latestSnapshot` returns the highest covered.
 - **Tolerant decode.** A snapshot that no longer decodes after a `State` schema change is treated as absent—the journal falls back to full replay rather than failing.
 - **Encoding is the store's business**, as with events.
-- **Retention is store-internal**—keep the latest, or keep N for forensics.
+- **Retention is explicit and cadence-based.** Periodic policies choose `.keepAll` or `.keepLast(N)`. The journal converts that policy into sequence bounds; the store deletes snapshots matching those bounds. Predicate snapshots do not initiate deletion, though a later periodic cleanup may include them.
 
 Snapshotting never enters the failure semantics:
 
 - A failed snapshot **save** is logged and journaling continues (compare Akka's `SnapshotFailed`)—the next cadence boundary tries again.
-- `.enabled` with **no snapshot store configured** degrades the same way: a warning at each cadence boundary, journaling unaffected.
+- A failed retention cleanup is also logged and does not fail the already-persisted event or saved snapshot.
+- `.every` with **no snapshot store configured** degrades the same way: a warning at each cadence boundary, journaling unaffected.
 - A snapshot that fails to **load** falls back to full replay. The journal is always the source of truth; snapshots only shorten recovery.
-- Mixed clusters are fine—one node `.enabled`, another `.disabled`, or different cadences only change snapshot density, never outcomes.
+- Mixed clusters are fine—one node `.every`, another `.disabled`, or different cadences only change snapshot density, never outcomes.
 
 ## Notes and caveats
 
 - **Failure semantics are deliberately minimal.** Persist failures propagate to the caller and freeze writes for that persistence ID (see point 4 above); there is no built-in retry, backoff, or automatic replay-on-failure. This model is a placeholder by design and will be revisited—expect the failure/recovery API to evolve.
-- **Replay cost is tunable, not zero.** Without snapshots, recovery replays the entire journal on every activation; `.enabled(every:)` bounds it to the tail after the latest snapshot.
+- **Replay cost is tunable, not zero.** Without snapshots, recovery replays the entire journal on every activation; `.every(numberOfEvents:retention:)` bounds it to the tail after the latest snapshot.
 - **Events are forever.** A journal is an append-only log of `Codable` events—evolve event types additively, or version them in your store's decoding.
 - **`emit` is local.** It requires the actor instance (`whenLocal`); remote callers go through distributed methods that emit on the hosting node.
 - **Lifecycle is managed.** The journal drops an actor's registration when its ID resigns, and refuses emits/restores after the plugin stops (failing loudly with `CancellationError` rather than crashing on shutdown races).
@@ -221,5 +262,6 @@ Requires Swift 6.2+, macOS 26 / iOS 26 / tvOS 26 / watchOS 26 (Linux supported),
 
 ## See also
 
+- [postgres-event-store](https://github.com/akbashev/postgres-event-store)—PostgreSQL implementations of `EventStore` and `SnapshotStore` using PostgresNIO.
 - [cluster-virtual-actors](https://github.com/akbashev/cluster-virtual-actors)—virtual actors with cluster placement and lifecycle; pair with `@EventSourced` for durable virtual actors.
 - [distributed-actors-showcase](https://github.com/akbashev/distributed-actors-showcase)—example applications.
