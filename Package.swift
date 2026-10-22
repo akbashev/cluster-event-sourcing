@@ -28,7 +28,7 @@ let package = Package(
     )
   ],
   dependencies: [
-    .package(url: "https://github.com/apple/swift-distributed-actors.git", branch: "main"),
+    .package(url: "https://github.com/turgai-labs/swift-distributed-actors.git", branch: "turgai-integration"),
     .package(url: "https://github.com/swiftlang/swift-syntax.git", "509.0.0"..<"605.0.0"),
   ],
   targets: [
