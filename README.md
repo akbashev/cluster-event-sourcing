@@ -43,7 +43,7 @@ distributed actor OrderActor {
 - **Every event is sequenced.** Each actor carries a `sequenceNumber: Int64` (added by the `@EventSourced` macro). `emit(event:)` increments it, persists with it, and rolls it back if the persist fails—so gaps and duplicates in the journal are detectable by your store.
 - **Ordered writes, per actor.** Persists for one persistence ID are task-chained inside the journal—events land in the store in emission order, never interleaved.
 - **Cluster-wide store.** Your `EventStore` is wrapped in a distributed actor hosted as a cluster singleton, so every node journals to and replays from the same place.
-- **Bring your own storage.** The package ships no store implementations. `EventStore` is a two-method protocol—back it with Postgres, files, FoundationDB, or an in-memory dictionary for tests.
+- **Bring your own storage.** The package ships no store implementations. `EventStore` is a three-method protocol—back it with Postgres, SQLite, FoundationDB, or an in-memory dictionary for tests.
 
 ## Quick start
 
@@ -72,13 +72,18 @@ Implement `EventStore`:
 ```swift
 protocol EventStore: Sendable {
   func persistEvent<Event: Codable & Sendable>(
-    _ event: Event, id: String, sequenceNumber: Int64
+    _ event: Event, id: String, sequenceNumber: Int64, tags: Set<EventTag>
   ) async throws
   func eventStream<Event: Codable & Sendable>(
     id: String, fromSequenceNumber: Int64
   ) async throws -> EventStream<Event>
+  func currentEventsByTag<Event: Codable & Sendable>(
+    _ tag: EventTag, after offset: Offset
+  ) async throws -> EventStream<Event>
 }
 ```
+
+`persistEvent` keeps the event and its tags in one write and gives it the journal's next `Offset`. Offsets grow in the order events are kept, across every entity, and an event kept later never gets a lower offset that a reader could still see after reading past it.
 
 `eventStream(id:fromSequenceNumber:)` must stream events with `sequenceNumber >= fromSequenceNumber` in journal order. Sequence numbers are contiguous from 1; larger starting values let snapshots skip replay. Local consumers use the stream directly. During recovery, the distributed store pushes envelopes one at a time to a temporary receiver and waits for each application to finish, providing backpressure without buffering the complete journal suffix.
 
@@ -241,6 +246,36 @@ Snapshotting never enters the failure semantics:
 - `.every` with **no snapshot store configured** degrades the same way: a warning at each cadence boundary, journaling unaffected.
 - A snapshot that fails to **load** falls back to full replay. The journal is always the source of truth; snapshots only shorten recovery.
 - Mixed clusters are fine—one node `.every`, another `.disabled`, or different cadences only change snapshot density, never outcomes.
+
+## Tags and read sides
+
+One entity answers for its own state; a question across many entities—every order a customer placed, every room a person is in—needs a read side built from all their events. Tag an entity type's events, then read every event with the tag back in the order it was kept (compare Akka Persistence Query's `eventsByTag` and Akka Projections):
+
+```swift
+@EventSourced
+distributed actor OrderActor {
+  // Tags are a property of the entity type, like snapshotting. Defaults to .none.
+  let tagging: Tagging<Event> = .always(EventTag("order"))
+
+  // ... State, Event, handleEvent, init as before
+}
+```
+
+`currentEventsByTag(_:after:)` streams every event with the tag after an offset, in offset order, and completes once caught up. A tag belongs to one entity type: each event decodes as that type's `Event`.
+
+A `Projection` keeps a read side up: it reads the tag from the offset the read side kept, hands each envelope to `process`, and once caught up reads again every `refreshInterval`, until its task is cancelled:
+
+```swift
+let orders = Projection<OrderActor.Event>(
+  tag: EventTag("order"),
+  offset: { try await readSide.offset() },
+  process: { envelope in try await readSide.apply(envelope) }  // the change, and envelope.offset
+)
+try await orders.run(on: eventStore, refreshInterval: .seconds(1))
+```
+
+- **Exactly once, or at least once.** `process` keeps the change and the offset. In one transaction, each event counts once. One after the other, an event whose offset wasn't kept yet is given again after a restart, so the change must then leave the read side as it was (an idempotent handler, as in Akka's at-least-once projections).
+- **Local, and one of each.** A projection reads the concrete store directly—streams don't cross the distributed-actor boundary—so it runs where it can open the store. Host it in a `ClusterSingleton` so exactly one runs; after it moves, it carries on from the kept offset.
 
 ## Notes and caveats
 
