@@ -458,7 +458,7 @@ struct EventSourcingTests {
     try await store.persistEvent("two", id: "b", sequenceNumber: 2, tags: [tag])
 
     // It catches up, then follows what's kept after it started.
-    var running = Task { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
+    var running = Task<Void, any Error> { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
     try await readSide.waitFor(count: 2)
     try await store.persistEvent("three", id: "a", sequenceNumber: 2, tags: [tag])
     try await readSide.waitFor(count: 3)
