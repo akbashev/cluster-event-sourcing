@@ -26,7 +26,7 @@ struct EventSourcingTests {
     let source = PullSource([1, 2])
     let stream = AsyncThrowingStream<EventEnvelope<Int>, any Error>(unfolding: {
       await source.next().map {
-        EventEnvelope(persistenceID: "stream", sequenceNumber: Int64($0), event: $0)
+        EventEnvelope(persistenceID: "stream", sequenceNumber: Int64($0), offset: Offset(Int64($0)), event: $0)
       }
     })
     #expect(await source.pullCount == 0)
@@ -406,6 +406,109 @@ struct EventSourcingTests {
     }
   }
 
+  @Test
+  func test_events_are_kept_with_their_entity_tags() async throws {
+    let store = MemoryEventStore()
+    let node = await ClusterSystem("tagging-node") {
+      $0.bindPort = 7346
+      $0.plugins.install(plugin: ClusterSingletonPlugin())
+      $0.plugins.install(plugin: ClusterJournalPlugin { _ in store })
+      $0.autoLeaderElection = .lowestReachable(minNumberOfMembers: 1)
+    }
+
+    node.cluster.join(endpoint: node.cluster.endpoint)
+    try await node.cluster.joined(within: .seconds(3))
+
+    let tag = EventTag("test")
+    var first: TestActor? = try await TestActor(actorSystem: node, with: "tagged-first", tagging: .always(tag))
+    var second: TestActor? = try await TestActor(actorSystem: node, with: "tagged-second", tagging: .always(tag))
+    var untagged: TestActor? = try await TestActor(actorSystem: node, with: "untagged")
+    try await first?.send(message: "one")
+    try await untagged?.send(message: "none")
+    try await second?.send(message: "two")
+    try await first?.send(message: "three")
+    first = .none
+    second = .none
+    untagged = .none
+
+    // Every entity's tagged events, in the order they were kept; none of the
+    // untagged entity's.
+    let tagged = try await Self.read(tag, after: .start, in: store)
+    #expect(tagged.map(\.event) == [.message("one"), .message("two"), .message("three")])
+    #expect(tagged.map(\.persistenceID) == ["tagged-first", "tagged-second", "tagged-first"])
+    #expect(tagged.map(\.sequenceNumber) == [1, 1, 2])
+    #expect(tagged.map(\.offset) == tagged.map(\.offset).sorted())
+
+    // Reading after an offset reads only what was kept after it.
+    let rest = try await Self.read(tag, after: tagged[0].offset, in: store)
+    #expect(rest.map(\.event) == [.message("two"), .message("three")])
+  }
+
+  @Test
+  func test_projection_follows_a_tag_from_its_offset() async throws {
+    let store = MemoryEventStore()
+    let tag = EventTag("projected")
+    let readSide = ReadSide()
+    func projection() -> Projection<String> {
+      Projection(tag: tag, offset: { await readSide.offset }, process: { await readSide.keep($0) })
+    }
+
+    try await store.persistEvent("one", id: "a", sequenceNumber: 1, tags: [tag])
+    try await store.persistEvent("other", id: "b", sequenceNumber: 1, tags: [])
+    try await store.persistEvent("two", id: "b", sequenceNumber: 2, tags: [tag])
+
+    // It catches up, then follows what's kept after it started.
+    var running = Task { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
+    try await readSide.waitFor(count: 2)
+    try await store.persistEvent("three", id: "a", sequenceNumber: 2, tags: [tag])
+    try await readSide.waitFor(count: 3)
+    running.cancel()
+    await #expect(throws: CancellationError.self) { try await running.value }
+    #expect(await readSide.kept == ["one", "two", "three"])
+
+    // Started again, it carries on from the offset it kept: nothing twice.
+    try await store.persistEvent("four", id: "a", sequenceNumber: 3, tags: [tag])
+    running = Task { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
+    try await readSide.waitFor(count: 4)
+    running.cancel()
+    _ = try? await running.value
+    #expect(await readSide.kept == ["one", "two", "three", "four"])
+  }
+
+  /// The test actors' events tagged `tag` after `offset`, read whole.
+  private static func read(
+    _ tag: EventTag,
+    after offset: Offset,
+    in store: MemoryEventStore
+  ) async throws -> [EventEnvelope<TestActor.Event>] {
+    let events: EventStream<TestActor.Event> = try await store.currentEventsByTag(tag, after: offset)
+    var envelopes: [EventEnvelope<TestActor.Event>] = []
+    for try await envelope in events {
+      envelopes.append(envelope)
+    }
+    return envelopes
+  }
+
+  /// A read side for `test_projection_follows_a_tag_from_its_offset`: what it
+  /// kept, and the offset of the last.
+  private actor ReadSide {
+    private(set) var kept: [String] = []
+    private(set) var offset = Offset.start
+
+    func keep(_ envelope: EventEnvelope<String>) {
+      self.kept.append(envelope.event)
+      self.offset = envelope.offset
+    }
+
+    /// Waits until it has kept `count` events, for a second at most.
+    func waitFor(count: Int) async throws {
+      for _ in 0..<100 where self.kept.count < count {
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      #expect(self.kept.count >= count, "Kept \(self.kept) after a second")
+    }
+  }
+
   @EventSourced
   distributed actor TestActor {
 
@@ -413,13 +516,15 @@ struct EventSourcingTests {
       var messages: [String] = []
     }
 
-    enum Event: Codable, Sendable {
+    enum Event: Codable, Sendable, Equatable {
       case message(String)
     }
 
     var state: State = .init()
 
     let snapshotting: Snapshotting<Event, State>
+
+    let tagging: Tagging<Event>
 
     distributed func send(message: String) async throws {
       try await self.emit(event: .message(message))
@@ -444,10 +549,12 @@ struct EventSourcingTests {
     init(
       actorSystem: ClusterSystem,
       with persistenceId: String = "test-actor",
-      snapshotting: Snapshotting<Event, State> = .disabled
+      snapshotting: Snapshotting<Event, State> = .disabled,
+      tagging: Tagging<Event> = .none
     ) async throws {
       self.actorSystem = actorSystem
       self.snapshotting = snapshotting
+      self.tagging = tagging
       try await actorSystem
         .journal
         .register(actor: self, with: persistenceId)
@@ -457,14 +564,25 @@ struct EventSourcingTests {
 
 actor MemoryEventStore: EventStore, Sendable {
 
-  private var dict: [PersistenceID: [Data]] = [:]
+  /// An event as kept: its offset is its place in `journal`, counting from 1.
+  private struct Kept {
+    let id: PersistenceID
+    let sequenceNumber: Int64
+    let tags: Set<EventTag>
+    let data: Data
+  }
+
+  private var journal: [Kept] = []
   private var eventStreamRequests: [PersistenceID: Int] = [:]
   private let encoder: JSONEncoder = JSONEncoder()
-  private let decoder: JSONDecoder = JSONDecoder()
 
-  func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID, sequenceNumber: Int64) throws {
-    let data = try encoder.encode(event)
-    self.dict[id, default: []].append(data)
+  func persistEvent<Event: Codable & Sendable>(
+    _ event: Event,
+    id: PersistenceID,
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
+  ) throws {
+    self.journal.append(Kept(id: id, sequenceNumber: sequenceNumber, tags: tags, data: try encoder.encode(event)))
   }
 
   func eventStream<Event: Codable & Sendable>(
@@ -472,20 +590,34 @@ actor MemoryEventStore: EventStore, Sendable {
     fromSequenceNumber: Int64
   ) async throws -> EventStream<Event> {
     self.eventStreamRequests[id, default: 0] += 1
-    let events = self.dict[id] ?? []
-    let drop = Int(fromSequenceNumber - 1)
+    return self.stream { kept, _ in kept.id == id && kept.sequenceNumber >= fromSequenceNumber }
+  }
+
+  func currentEventsByTag<Event: Codable & Sendable>(
+    _ tag: EventTag,
+    after offset: Offset
+  ) async throws -> EventStream<Event> {
+    self.stream { kept, keptAt in kept.tags.contains(tag) && keptAt > offset }
+  }
+
+  /// The events kept so far that `included` takes, read one at a time.
+  private func stream<Event: Codable & Sendable>(
+    of included: (Kept, Offset) -> Bool
+  ) -> EventStream<Event> {
     let cursor = MemoryEventCursor<Event>(
-      id: id,
-      fromSequenceNumber: fromSequenceNumber,
-      events: Array(events.dropFirst(min(drop, events.count)))
+      kept: self.journal.enumerated().compactMap { index, kept in
+        let offset = Offset(Int64(index + 1))
+        guard included(kept, offset) else { return nil }
+        return (kept.id, kept.sequenceNumber, offset, kept.data)
+      }
     )
     return AsyncThrowingStream(unfolding: {
-      await cursor.next()
+      try await cursor.next()
     })
   }
 
   func flush() {
-    self.dict.removeAll()
+    self.journal.removeAll()
   }
 
   func eventStreamRequestCount(for id: PersistenceID) -> Int {
@@ -513,31 +645,23 @@ private actor PullSource<Element: Sendable> {
 }
 
 private actor MemoryEventCursor<Event: Codable & Sendable> {
-  private let id: PersistenceID
-  private let fromSequenceNumber: Int64
-  private let events: [Data]
+  private let kept: [(id: PersistenceID, sequenceNumber: Int64, offset: Offset, data: Data)]
   private var index = 0
 
-  init(id: PersistenceID, fromSequenceNumber: Int64, events: [Data]) {
-    self.id = id
-    self.fromSequenceNumber = fromSequenceNumber
-    self.events = events
+  init(kept: [(id: PersistenceID, sequenceNumber: Int64, offset: Offset, data: Data)]) {
+    self.kept = kept
   }
 
-  func next() -> EventEnvelope<Event>? {
-    while self.index < self.events.count {
-      let offset = self.index
-      self.index += 1
-      guard let event = try? JSONDecoder().decode(Event.self, from: self.events[offset]) else {
-        continue
-      }
-      return EventEnvelope(
-        persistenceID: self.id,
-        sequenceNumber: self.fromSequenceNumber + Int64(offset),
-        event: event
-      )
-    }
-    return nil
+  func next() throws -> EventEnvelope<Event>? {
+    guard self.index < self.kept.count else { return nil }
+    let kept = self.kept[self.index]
+    self.index += 1
+    return EventEnvelope(
+      persistenceID: kept.id,
+      sequenceNumber: kept.sequenceNumber,
+      offset: kept.offset,
+      event: try JSONDecoder().decode(Event.self, from: kept.data)
+    )
   }
 }
 

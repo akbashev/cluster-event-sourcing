@@ -26,7 +26,12 @@ public actor ClusterJournalPlugin {
     case invalidRetentionCount(Int)
   }
 
-  public func emit<E: Codable & Sendable>(_ event: E, id: ClusterSystem.ActorID, sequenceNumber: Int64) async throws {
+  public func emit<E: Codable & Sendable>(
+    _ event: E,
+    id: ClusterSystem.ActorID,
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
+  ) async throws {
     guard let persistenceId = self.registeredActors[id] else {
       throw RegistrationError.notRegistered(id)
     }
@@ -66,7 +71,7 @@ public actor ClusterJournalPlugin {
     let task = Task { [emitTask, store, log] in
       _ = try await emitTask?.value
       guard !Task.isCancelled else { throw CancellationError() }
-      try await store.persistEvent(event, id: persistenceId, sequenceNumber: sequenceNumber)
+      try await store.persistEvent(event, id: persistenceId, sequenceNumber: sequenceNumber, tags: tags)
       log.debug("Emitted event: \(event) for actor with id: \(persistenceId)")
     }
     self.emitTasks[persistenceId] = task
@@ -261,7 +266,8 @@ extension ClusterSystem {
 
 extension EventSourced {
   // `whenLocal` is async atm, ideally should be non-async 🤔
-  /// Increments `sequenceNumber`, persists the event, and only then applies it
+  /// Increments `sequenceNumber`, persists the event with its tags (see
+  /// `tagging`), and only then applies it
   /// to live state. On any failure the sequence number is rolled back and the
   /// error rethrown — the actor never applies an event that didn't reach the
   /// journal, and what to do next (retry, drop the actor, …) is the caller's
@@ -284,7 +290,8 @@ extension EventSourced {
         try await self.actorSystem.journal.emit(
           event,
           id: local.id,
-          sequenceNumber: local.sequenceNumber
+          sequenceNumber: local.sequenceNumber,
+          tags: local.tagging.tags(for: event)
         )
         local.handleEvent(event)
       } catch {
@@ -344,8 +351,13 @@ distributed actor AnyEventStore: ClusterSingleton {
 
   private var store: any EventStore
 
-  distributed func persistEvent<Event: Codable & Sendable>(_ event: Event, id: PersistenceID, sequenceNumber: Int64) async throws {
-    try await self.store.persistEvent(event, id: id, sequenceNumber: sequenceNumber)
+  distributed func persistEvent<Event: Codable & Sendable>(
+    _ event: Event,
+    id: PersistenceID,
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
+  ) async throws {
+    try await self.store.persistEvent(event, id: id, sequenceNumber: sequenceNumber, tags: tags)
   }
 
   distributed func replay<Event: Codable & Sendable>(

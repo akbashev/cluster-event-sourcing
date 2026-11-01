@@ -1,22 +1,44 @@
-/// A persisted event together with its position in the journal.
+/// Where an event is in the journal, across every entity: offsets grow in the
+/// order events were kept. Compare Akka Persistence Query's `Sequence` offset.
+public struct Offset: Hashable, Comparable, Codable, Sendable, CustomStringConvertible {
+  public let rawValue: Int64
+
+  public init(_ rawValue: Int64) {
+    self.rawValue = rawValue
+  }
+
+  /// Before the journal's first event: reading after it reads everything.
+  public static let start = Offset(0)
+
+  public static func < (lhs: Offset, rhs: Offset) -> Bool {
+    lhs.rawValue < rhs.rawValue
+  }
+
+  public var description: String { String(self.rawValue) }
+}
+
+/// A persisted event together with its position in the journal: its place in
+/// its entity's log, and its offset in the whole journal.
 /// Modeled after Akka Persistence Query's `EventEnvelope` — theirs
-/// additionally carries offset/timestamp (and entity type/slice for
-/// projections); grow this as those features land.
+/// additionally carries a timestamp and entity type/slice.
 public struct EventEnvelope<Event: Codable & Sendable>: Codable, Sendable {
   public let persistenceID: PersistenceID
   public let sequenceNumber: Int64
+  public let offset: Offset
   public let event: Event
 
-  public init(persistenceID: PersistenceID, sequenceNumber: Int64, event: Event) {
+  public init(persistenceID: PersistenceID, sequenceNumber: Int64, offset: Offset, event: Event) {
     self.persistenceID = persistenceID
     self.sequenceNumber = sequenceNumber
+    self.offset = offset
     self.event = event
   }
 }
 
 public protocol EventStore: Sendable {
-  /// Persist one event. This store holds the event log and nothing else —
-  /// snapshots live in a separate `SnapshotStore`.
+  /// Persist one event, with `tags` (see `EventSourced.tagging`). This store
+  /// holds the event log and nothing else — snapshots live in a separate
+  /// `SnapshotStore`.
   ///
   /// Implementations must enforce uniqueness per `(id, sequenceNumber)`
   /// (e.g. a SQL unique constraint or expected-version check) and must throw
@@ -29,21 +51,25 @@ public protocol EventStore: Sendable {
   /// state (see `ClusterJournalPlugin`, which also fails all later emits for
   /// the same persistence ID once a persist has failed).
   ///
+  /// The event and its tags are kept in one write: an event is never kept
+  /// without its tags. It gets the next offset, and an event kept later never
+  /// gets a lower one that a reader could still see after reading past it.
+  ///
   /// Events are kept forever by default; deletion is an explicit, separate
   /// decision (it destroys history for any other consumer of the log).
   func persistEvent<Event: Codable & Sendable>(
     _ event: Event,
     id: String,
-    sequenceNumber: Int64
+    sequenceNumber: Int64,
+    tags: Set<EventTag>
   ) async throws
 
   /// Finite stream of events with `sequenceNumber >= fromSequenceNumber`, in
   /// sequence order — completes once the journal is caught up (the analog of
   /// Akka Persistence Query's `currentEventsByPersistenceId`). This is THE
-  /// read primitive: replay, and later projections, consume a stream rather
-  /// than a fully buffered array, so implementations should pull rows on
-  /// demand (index scan, `WHERE seq >= …`) instead of materializing the whole
-  /// log.
+  /// replay primitive: replay consumes a stream rather than a fully buffered
+  /// array, so implementations should pull rows on demand (index scan,
+  /// `WHERE seq >= …`) instead of materializing the whole log.
   ///
   /// Sequence numbers are contiguous starting at 1, so
   /// `fromSequenceNumber: 1` reads the whole log; larger values are the read
@@ -56,6 +82,19 @@ public protocol EventStore: Sendable {
   func eventStream<Event: Codable & Sendable>(
     id: String,
     fromSequenceNumber: Int64
+  ) async throws -> EventStream<Event>
+
+  /// Finite stream of every event tagged `tag` with an offset after `offset`,
+  /// across all entities, in offset order — completes once the journal is
+  /// caught up (the analog of Akka Persistence Query's `currentEventsByTag`).
+  /// A read side follows a tag by reading again after the last offset it
+  /// handled (see `Projection`). Each event decodes as `Event`, the type of the
+  /// one entity type the tag belongs to; one that doesn't fails the read.
+  ///
+  /// Like `eventStream`, it's read locally, beside the concrete store.
+  func currentEventsByTag<Event: Codable & Sendable>(
+    _ tag: EventTag,
+    after offset: Offset
   ) async throws -> EventStream<Event>
 }
 

@@ -62,6 +62,49 @@ public enum Snapshotting<Event: Sendable, State: Sendable>: Sendable {
   }
 }
 
+/// A label an entity type gives its events, so every event with it can be read
+/// back in the order they were kept (`EventStore.currentEventsByTag`), by a
+/// read side built from many entities' events. Compare Akka Persistence's tags.
+///
+/// A tag belongs to one entity type: every event with it is that type's
+/// `Event`, which is what a read by the tag decodes.
+public struct EventTag: Hashable, Codable, Sendable, CustomStringConvertible {
+  public let rawValue: String
+
+  public init(_ rawValue: String) {
+    self.rawValue = rawValue
+  }
+
+  public var description: String { self.rawValue }
+}
+
+/// Tagging policy of an entity type (see `EventSourced.tagging`): the tags each
+/// event it emits is kept with. Compare Akka Persistence's `withTagger`.
+public struct Tagging<Event: Sendable>: Sendable {
+  private let rule: @Sendable (Event) -> Set<EventTag>
+
+  /// Tags each event with what `rule` gives for it.
+  public init(_ rule: @escaping @Sendable (Event) -> Set<EventTag>) {
+    self.rule = rule
+  }
+
+  /// No tags: the events are read back only by their entity's persistence ID.
+  public static var none: Self {
+    Self { _ in [] }
+  }
+
+  /// Every event with each of `tags`.
+  public static func always(_ tags: EventTag...) -> Self {
+    let tags = Set(tags)
+    return Self { _ in tags }
+  }
+
+  /// The tags `event` is kept with.
+  public func tags(for event: Event) -> Set<EventTag> {
+    self.rule(event)
+  }
+}
+
 public protocol EventSourced: DistributedActor where ActorSystem == ClusterSystem {
   associatedtype Event: Codable & Sendable
   /// The actor's whole state as a single `Codable` value. Snapshots are taken
@@ -74,9 +117,13 @@ public protocol EventSourced: DistributedActor where ActorSystem == ClusterSyste
   /// config) so the policy and retention travel with the entity wherever it
   /// is hosted. Defaults to `.disabled` (see extension below).
   var snapshotting: Snapshotting<Event, State> { get }
+  /// Tags of the events this entity type emits, expressed in code for the same
+  /// reason as `snapshotting`. Defaults to `.none` (see extension below).
+  var tagging: Tagging<Event> { get }
   func handleEvent(_ event: Event)
 }
 
 extension EventSourced {
   public var snapshotting: Snapshotting<Event, State> { .disabled }
+  public var tagging: Tagging<Event> { .none }
 }
