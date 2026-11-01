@@ -37,8 +37,8 @@ public struct Projection<Event: Codable & Sendable>: Sendable {
 
   /// Keeps the read side up with `store` until the task running it is
   /// cancelled, which ends it with `CancellationError`; a failed read or
-  /// `process` ends it with that error.
-  public func run(on store: any EventStore, refreshInterval: Duration = .seconds(1)) async throws {
+  /// `process` ends it with that error. It never ends otherwise.
+  public func run(on store: any EventStore, refreshInterval: Duration = .seconds(1)) async throws -> Never {
     var after = try await self.offset()
     while true {
       let events: EventStream<Event> = try await store.currentEventsByTag(self.tag, after: after)
