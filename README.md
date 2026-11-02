@@ -275,6 +275,7 @@ try await orders.run(on: eventStore, refreshInterval: .seconds(1))
 ```
 
 - **Exactly once, or at least once.** `process` keeps the change and the offset. In one transaction, each event counts once. One after the other, an event whose offset wasn't kept yet is given again after a restart, so the change must then leave the read side as it was (an idempotent handler, as in Akka's at-least-once projections).
+- **Restarted after a failure.** `runRestarting(on:refreshInterval:restartAfter:failed:)` runs it until its task is cancelled; when a read or `process` fails, `failed` hears why, and after `restartAfter` it runs again from the kept offset, as Akka Projections restarts a failed projection.
 - **Local, and one of each.** A projection reads the concrete store directly—streams don't cross the distributed-actor boundary—so it runs where it can open the store. Host it in a `ClusterSingleton` so exactly one runs; after it moves, it carries on from the kept offset.
 
 ## Notes and caveats
