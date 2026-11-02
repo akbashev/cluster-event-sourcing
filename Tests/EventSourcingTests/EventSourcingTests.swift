@@ -475,6 +475,47 @@ struct EventSourcingTests {
     #expect(await readSide.kept == ["one", "two", "three", "four"])
   }
 
+  @Test
+  func test_a_failed_projection_starts_again_from_its_offset() async throws {
+    let store = MemoryEventStore()
+    let tag = EventTag("projected")
+    let readSide = ReadSide()
+    let failures = Failures()
+    let (heard, hearing) = AsyncStream<String>.makeStream()
+    let projection = Projection<String>(tag: tag, offset: { await readSide.offset }) { envelope in
+      // The first time "two" comes, keeping it fails.
+      if envelope.event == "two", await failures.first() { throw ReadSideFailed() }
+      await readSide.keep(envelope)
+    }
+    try await store.persistEvent("one", id: "a", sequenceNumber: 1, tags: [tag])
+    try await store.persistEvent("two", id: "a", sequenceNumber: 2, tags: [tag])
+
+    let running = Task {
+      await projection.runRestarting(
+        on: store, refreshInterval: .milliseconds(10), restartAfter: .milliseconds(10),
+        failed: { hearing.yield(String(describing: $0)) })
+    }
+    try await readSide.waitFor(count: 2)
+    running.cancel()
+    await running.value
+    hearing.finish()
+    #expect(await readSide.kept == ["one", "two"])
+    #expect(await Array(heard) == [String(describing: ReadSideFailed())])
+  }
+
+  private struct ReadSideFailed: Error {}
+
+  /// Whether keeping an event failed yet, for `test_a_failed_projection_starts_again_from_its_offset`.
+  private actor Failures {
+    private var failedOnce = false
+
+    /// Whether this is the first time: only it fails.
+    func first() -> Bool {
+      defer { failedOnce = true }
+      return !failedOnce
+    }
+  }
+
   /// The test actors' events tagged `tag` after `offset`, read whole.
   private static func read(
     _ tag: EventTag,

@@ -50,4 +50,27 @@ public struct Projection<Event: Codable & Sendable>: Sendable {
       try await Task.sleep(for: refreshInterval)
     }
   }
+
+  /// Keeps the read side up with `store` until the task running it is
+  /// cancelled, starting again after it fails, as Akka Projections restarts a
+  /// failed projection: `failed` hears each failure, and `restartAfter` later
+  /// it runs again from the offset the read side kept.
+  public func runRestarting(
+    on store: any EventStore,
+    refreshInterval: Duration = .seconds(1),
+    restartAfter: Duration = .seconds(5),
+    failed: @Sendable (any Error) -> Void
+  ) async {
+    while !Task.isCancelled {
+      do {
+        try await self.run(on: store, refreshInterval: refreshInterval)
+      } catch is CancellationError {
+        return
+      } catch {
+        failed(error)
+        // Cancelled while it waits, it ends at the loop's check.
+        try? await Task.sleep(for: restartAfter)
+      }
+    }
+  }
 }
