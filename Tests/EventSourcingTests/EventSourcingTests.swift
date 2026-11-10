@@ -449,16 +449,13 @@ struct EventSourcingTests {
     let store = MemoryEventStore()
     let tag = EventTag("projected")
     let readSide = ReadSide()
-    func projection() -> Projection<String> {
-      Projection(tag: tag, offset: { await readSide.offset }, process: { await readSide.keep($0) })
-    }
 
     try await store.persistEvent("one", id: "a", sequenceNumber: 1, tags: [tag])
     try await store.persistEvent("other", id: "b", sequenceNumber: 1, tags: [])
     try await store.persistEvent("two", id: "b", sequenceNumber: 2, tags: [tag])
 
     // It catches up, then follows what's kept after it started.
-    var running = Task<Void, any Error> { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
+    var running = Task<Void, any Error> { try await readSide.follow(tag, in: store) }
     try await readSide.waitFor(count: 2)
     try await store.persistEvent("three", id: "a", sequenceNumber: 2, tags: [tag])
     try await readSide.waitFor(count: 3)
@@ -468,7 +465,7 @@ struct EventSourcingTests {
 
     // Started again, it carries on from the offset it kept: nothing twice.
     try await store.persistEvent("four", id: "a", sequenceNumber: 3, tags: [tag])
-    running = Task { try await projection().run(on: store, refreshInterval: .milliseconds(10)) }
+    running = Task { try await readSide.follow(tag, in: store) }
     try await readSide.waitFor(count: 4)
     running.cancel()
     _ = try? await running.value
@@ -480,20 +477,13 @@ struct EventSourcingTests {
     let store = MemoryEventStore()
     let tag = EventTag("projected")
     let readSide = ReadSide()
-    let failures = Failures()
     let (heard, hearing) = AsyncStream<String>.makeStream()
-    let projection = Projection<String>(tag: tag, offset: { await readSide.offset }) { envelope in
-      // The first time "two" comes, keeping it fails.
-      if envelope.event == "two", await failures.first() { throw ReadSideFailed() }
-      await readSide.keep(envelope)
-    }
     try await store.persistEvent("one", id: "a", sequenceNumber: 1, tags: [tag])
     try await store.persistEvent("two", id: "a", sequenceNumber: 2, tags: [tag])
 
+    // The first time "two" comes, keeping it fails.
     let running = Task {
-      await projection.runRestarting(
-        on: store, refreshInterval: .milliseconds(10), restartAfter: .milliseconds(10),
-        failed: { hearing.yield(String(describing: $0)) })
+      await readSide.followRestarting(tag, in: store, failingOnce: "two") { hearing.yield(String(describing: $0)) }
     }
     try await readSide.waitFor(count: 2)
     running.cancel()
@@ -504,17 +494,6 @@ struct EventSourcingTests {
   }
 
   private struct ReadSideFailed: Error {}
-
-  /// Whether keeping an event failed yet, for `test_a_failed_projection_starts_again_from_its_offset`.
-  private actor Failures {
-    private var failedOnce = false
-
-    /// Whether this is the first time: only it fails.
-    func first() -> Bool {
-      defer { failedOnce = true }
-      return !failedOnce
-    }
-  }
 
   /// The test actors' events tagged `tag` after `offset`, read whole.
   private static func read(
@@ -535,8 +514,45 @@ struct EventSourcingTests {
   private actor ReadSide {
     private(set) var kept: [String] = []
     private(set) var offset = Offset.start
+    /// The event whose keeping failed once already, when one did.
+    private var failed: String?
 
-    func keep(_ envelope: EventEnvelope<String>) {
+    /// Follows `tag` in `store`: the projection runs on this actor, so what it
+    /// reads and keeps is its own state.
+    func follow(_ tag: EventTag, in store: MemoryEventStore) async throws {
+      try await Projection<String>(tag: tag).run(
+        on: store,
+        refreshInterval: .milliseconds(10),
+        offset: { self.offset },
+        process: { self.keep($0) }
+      )
+    }
+
+    /// Follows `tag` in `store`, starting again after a failure: keeping
+    /// `failing` fails the first time, and `failed` hears it.
+    func followRestarting(
+      _ tag: EventTag,
+      in store: MemoryEventStore,
+      failingOnce failing: String,
+      failed: (any Error) -> Void
+    ) async {
+      await Projection<String>(tag: tag).runRestarting(
+        on: store,
+        refreshInterval: .milliseconds(10),
+        restartAfter: .milliseconds(10),
+        offset: { self.offset },
+        process: { envelope in
+          if envelope.event == failing, self.failed != failing {
+            self.failed = failing
+            throw ReadSideFailed()
+          }
+          self.keep(envelope)
+        },
+        failed: failed
+      )
+    }
+
+    private func keep(_ envelope: EventEnvelope<String>) {
       self.kept.append(envelope.event)
       self.offset = envelope.offset
     }

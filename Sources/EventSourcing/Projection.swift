@@ -7,6 +7,10 @@
 /// `refreshInterval`, until its task is cancelled. Compare Akka Persistence
 /// JDBC's `eventsByTag`, which polls the same way.
 ///
+/// It runs on the isolation it's given, its caller's by default: run inside a
+/// read side's actor, `offset` and `process` are that actor's own code, which
+/// read and change its state directly.
+///
 /// `process` keeps the event's change and the envelope's offset, which is
 /// where the next `run` starts. Kept in one transaction, each event counts
 /// exactly once. Kept one after the other, an event whose offset wasn't kept
@@ -20,31 +24,33 @@
 /// keeps it that way.
 public struct Projection<Event: Codable & Sendable>: Sendable {
   public let tag: EventTag
-  /// Where the read side has read up to: `Offset.start` when it's read nothing.
-  public let offset: @Sendable () async throws -> Offset
-  /// Keeps one event's change, and its envelope's offset.
-  public let process: @Sendable (EventEnvelope<Event>) async throws -> Void
 
-  public init(
-    tag: EventTag,
-    offset: @escaping @Sendable () async throws -> Offset,
-    process: @escaping @Sendable (EventEnvelope<Event>) async throws -> Void
-  ) {
+  public init(tag: EventTag) {
     self.tag = tag
-    self.offset = offset
-    self.process = process
   }
 
   /// Keeps the read side up with `store` until the task running it is
-  /// cancelled, which ends it with `CancellationError`; a failed read or
-  /// `process` ends it with that error. It never ends otherwise.
-  public func run(on store: any EventStore, refreshInterval: Duration = .seconds(1)) async throws -> Never {
-    var after = try await self.offset()
+  /// cancelled, which ends it with `CancellationError`; a failed read, `offset`
+  /// or `process` ends it with that error. It never ends otherwise.
+  ///
+  /// - Parameters:
+  ///   - isolation: Where it runs, and `offset` and `process` with it.
+  ///   - offset: Where the read side has read up to: `Offset.start` when it's
+  ///     read nothing.
+  ///   - process: Keeps one event's change, and its envelope's offset.
+  public func run(
+    on store: any EventStore,
+    refreshInterval: Duration = .seconds(1),
+    isolation: isolated (any Actor)? = #isolation,
+    offset: () async throws -> Offset,
+    process: (EventEnvelope<Event>) async throws -> Void
+  ) async throws -> Never {
+    var after = try await offset()
     while true {
       let events: EventStream<Event> = try await store.currentEventsByTag(self.tag, after: after)
       for try await envelope in events {
         try Task.checkCancellation()
-        try await self.process(envelope)
+        try await process(envelope)
         after = envelope.offset
       }
       try await Task.sleep(for: refreshInterval)
@@ -59,11 +65,20 @@ public struct Projection<Event: Codable & Sendable>: Sendable {
     on store: any EventStore,
     refreshInterval: Duration = .seconds(1),
     restartAfter: Duration = .seconds(5),
-    failed: @Sendable (any Error) -> Void
+    isolation: isolated (any Actor)? = #isolation,
+    offset: () async throws -> Offset,
+    process: (EventEnvelope<Event>) async throws -> Void,
+    failed: (any Error) -> Void
   ) async {
     while !Task.isCancelled {
       do {
-        try await self.run(on: store, refreshInterval: refreshInterval)
+        try await self.run(
+          on: store,
+          refreshInterval: refreshInterval,
+          isolation: isolation,
+          offset: offset,
+          process: process
+        )
       } catch is CancellationError {
         return
       } catch {
