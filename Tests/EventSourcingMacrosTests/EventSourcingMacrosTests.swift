@@ -8,7 +8,7 @@ import Testing
 struct EventSourcingMacrosTests {
   @Test
   func testEventSourcedMacro() throws {
-    let testMacros: [String: Macro.Type] = [
+    let testMacros: [String: any Macro.Type] = [
       "EventSourced": EventSourcedMacro.self
     ]
 
