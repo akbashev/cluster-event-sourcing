@@ -1,5 +1,6 @@
-import Distributed
-import DistributedCluster
+import AsyncAlgorithms
+public import Distributed
+public import DistributedCluster
 import Logging
 
 public actor ClusterJournalPlugin {
@@ -113,78 +114,81 @@ public actor ClusterJournalPlugin {
     }
   }
 
-  /// As we already checked whenLocal on `actorReady`—would be nice to have some type level understanding already here and not to double check...
-  public func restoreEventsFor<A: EventSourced>(actor: A, id persistenceId: PersistenceID) async throws {
-    try Task.checkCancellation()
+  /// Registers `actor` as `persistenceID`, recovering its state from the
+  /// journal first. It runs in `actor`'s own isolation, as the actor's init
+  /// calls it: the recovery changes the actor's state directly, and only
+  /// asks the plugin for what's its to give.
+  public func register<A: EventSourced>(actor: isolated A, with persistenceID: PersistenceID) async throws {
+    try await self.unregistered(actor.id)
+    try await self.restore(actor, id: persistenceID)
+    await self.registered(actor.id, as: persistenceID)
+  }
 
-    // A restore may be called during shutdown, after `stop()` cleared the
-    // plugin's IUOs. Fail the activation loudly (never crash the process, and
-    // never let an actor come up believing it is current on an empty replay —
-    // the same shutdown race `emit` already guards against).
-    guard let store, let actorSystem else {
-      throw CancellationError()
-    }
+  /// `actor`'s state recovered, in its isolation: from its latest snapshot when
+  /// one loads, then every event after it, each applied as the store sends it.
+  private func restore<A: EventSourced>(_ actor: isolated A, id persistenceId: PersistenceID) async throws {
+    try Task.checkCancellation()
+    let (store, snapshotStore, actorSystem) = try await self.journal()
 
     // Phase 1: restore from the latest snapshot if one is available. A
     // snapshot that cannot be loaded (store down, undecodable after a State
     // schema change) falls back to full replay — the log is complete.
-    var fromSequenceNumber: Int64 = 1
-    if let snapshotStore,
-      let snapshot: Snapshot<A.State> = try? await snapshotStore.latestSnapshot(id: persistenceId)
-    {
-      await actor.whenLocal { local in
-        local.state = snapshot.state
-        local.sequenceNumber = snapshot.coveredSequenceNumber
-      }
-      fromSequenceNumber = snapshot.coveredSequenceNumber + 1
+    let snapshot: Snapshot<A.State>? =
+      if let snapshotStore { try? await snapshotStore.latestSnapshot(id: persistenceId) } else { nil }
+    if let snapshot {
+      actor.state = snapshot.state
+      actor.sequenceNumber = snapshot.coveredSequenceNumber
     }
+    let fromSequenceNumber = (snapshot?.coveredSequenceNumber ?? 0) + 1
     try Task.checkCancellation()
 
-    // Phase 2: ask the store singleton to push replay envelopes to a temporary
-    // local receiver. This mirrors Akka's ReplayMessages/ReplayedMessage flow:
-    // the stream stays local to the store and each receiver invocation applies
-    // one event before acknowledging it, providing natural backpressure.
-    let replayFromSequenceNumber = fromSequenceNumber
+    // Phase 2: the store singleton pushes each event to a temporary receiver,
+    // as Akka's ReplayMessages/ReplayedMessage do, so the stream stays beside
+    // the store. The receiver hands each one over a channel that waits until
+    // it's applied here: one event at a time, as the actor's own work.
+    let replayed = AsyncChannel<EventEnvelope<A.Event>>()
+    // An actor no longer taking events lets the store finish its replay.
+    defer { replayed.finish() }
     let receiver = EventReplayReceiver<A.Event>(actorSystem: actorSystem) { envelope in
-      guard
-        try await actor.whenLocal({ local in
-          // A cancelled activation must fail loudly, never come up stale: after
-          // a snapshot restore the sequence number is already advanced, so
-          // silently skipping the fold would register the actor as current
-          // while it is behind the journal.
-          if Task.isCancelled { throw CancellationError() }
-          local.handleEvent(envelope.event)
-          local.sequenceNumber = envelope.sequenceNumber
-          return true
-        }) == true
-      else {
-        throw CancellationError()
-      }
+      await replayed.send(envelope)
     }
-    try await store.replay(
-      id: persistenceId,
-      fromSequenceNumber: fromSequenceNumber,
-      receiver: receiver
-    )
+    async let replaying: Void = {
+      defer { replayed.finish() }
+      try await store.replay(id: persistenceId, fromSequenceNumber: fromSequenceNumber, receiver: receiver)
+    }()
+    for await envelope in replayed {
+      // A cancelled activation must fail loudly, never come up stale: after a
+      // snapshot restore the sequence number is already advanced, so silently
+      // skipping the fold would register the actor as current while it is
+      // behind the journal.
+      try Task.checkCancellation()
+      actor.handleEvent(envelope.event)
+      actor.sequenceNumber = envelope.sequenceNumber
+    }
+    try await replaying
     try Task.checkCancellation()
-    let recoveredSequenceNumber = await actor.whenLocal { local in
-      local.sequenceNumber
-    }
-    let appliedEvents =
-      recoveredSequenceNumber.map {
-        max(0, $0 - replayFromSequenceNumber + 1)
-      } ?? 0
     actorSystem.log.debug(
-      "Restored actor with id: \(persistenceId), applied \(appliedEvents) events"
+      "Restored actor with id: \(persistenceId), applied \(max(0, actor.sequenceNumber - fromSequenceNumber + 1)) events"
     )
   }
 
-  public func register<A: EventSourced>(actor: A, with persistentId: PersistenceID) async throws {
-    if let existing = self.registeredActors[actor.id] {
-      throw RegistrationError.alreadyRegistered(actor.id, existingPersistenceID: existing)
+  /// The stores and the system recovery reads from: refused once the plugin
+  /// stopped, as a restore during shutdown must fail loudly, never crash the
+  /// process or bring an actor up believing it is current on an empty replay.
+  private func journal() throws -> (AnyEventStore, AnySnapshotStore?, ClusterSystem) {
+    guard let store, let actorSystem else { throw CancellationError() }
+    return (store, snapshotStore, actorSystem)
+  }
+
+  /// Refused when `id` is registered already.
+  private func unregistered(_ id: ClusterSystem.ActorID) throws {
+    if let existing = self.registeredActors[id] {
+      throw RegistrationError.alreadyRegistered(id, existingPersistenceID: existing)
     }
-    try await self.restoreEventsFor(actor: actor, id: persistentId)
-    self.registeredActors[actor.id] = persistentId
+  }
+
+  private func registered(_ id: ClusterSystem.ActorID, as persistenceID: PersistenceID) {
+    self.registeredActors[id] = persistenceID
   }
 
   fileprivate func removeActorWith(id: ClusterSystem.ActorID) {
@@ -265,7 +269,6 @@ extension ClusterSystem {
 }
 
 extension EventSourced {
-  // `whenLocal` is async atm, ideally should be non-async 🤔
   /// Increments `sequenceNumber`, persists the event with its tags (see
   /// `tagging`), and only then applies it
   /// to live state. On any failure the sequence number is rolled back and the
@@ -284,55 +287,53 @@ extension EventSourced {
   /// logged and never fails the emit (compare Akka's non-fatal
   /// `SnapshotFailed` signal).
   public func emit(event: Event) async throws {
-    try await self.whenLocal { local in
-      local.sequenceNumber += 1
-      do {
-        try await self.actorSystem.journal.emit(
-          event,
-          id: local.id,
-          sequenceNumber: local.sequenceNumber,
-          tags: local.tagging.tags(for: event)
-        )
-        local.handleEvent(event)
-      } catch {
-        local.sequenceNumber -= 1
-        throw error
-      }
+    self.sequenceNumber += 1
+    do {
+      try await self.actorSystem.journal.emit(
+        event,
+        id: self.id,
+        sequenceNumber: self.sequenceNumber,
+        tags: self.tagging.tags(for: event)
+      )
+      self.handleEvent(event)
+    } catch {
+      self.sequenceNumber -= 1
+      throw error
+    }
 
-      let snapshotRequest: (retention: RetentionCriteria, periodicSnapshotEvery: Int?)?
-      switch local.snapshotting {
-      case .disabled:
+    let snapshotRequest: (retention: RetentionCriteria, periodicSnapshotEvery: Int?)?
+    switch self.snapshotting {
+    case .disabled:
+      snapshotRequest = nil
+    case .every(let numberOfEvents, let configuredRetention, let rule):
+      let isPeriodic =
+        numberOfEvents > 0 && self.sequenceNumber % Int64(numberOfEvents) == 0
+      if isPeriodic {
+        snapshotRequest = (configuredRetention, numberOfEvents)
+      } else if rule?(event, self.state, self.sequenceNumber) == true {
+        snapshotRequest = (.keepAll, nil)
+      } else {
         snapshotRequest = nil
-      case .every(let numberOfEvents, let configuredRetention, let rule):
-        let isPeriodic =
-          numberOfEvents > 0 && local.sequenceNumber % Int64(numberOfEvents) == 0
-        if isPeriodic {
-          snapshotRequest = (configuredRetention, numberOfEvents)
-        } else if rule?(event, local.state, local.sequenceNumber) == true {
-          snapshotRequest = (.keepAll, nil)
-        } else {
-          snapshotRequest = nil
-        }
-      case .when(let rule):
-        snapshotRequest =
-          rule(event, local.state, local.sequenceNumber)
-          ? (.keepAll, nil)
-          : nil
       }
-      if let snapshotRequest {
-        do {
-          try await self.actorSystem.journal.saveSnapshot(
-            local.state,
-            id: local.id,
-            coveredSequenceNumber: local.sequenceNumber,
-            retention: snapshotRequest.retention,
-            periodicSnapshotEvery: snapshotRequest.periodicSnapshotEvery
-          )
-        } catch {
-          self.actorSystem.log.warning(
-            "Snapshot save or retention cleanup failed for actor with id: \(local.id) at sequence number \(local.sequenceNumber): \(error)"
-          )
-        }
+    case .when(let rule):
+      snapshotRequest =
+        rule(event, self.state, self.sequenceNumber)
+        ? (.keepAll, nil)
+        : nil
+    }
+    if let snapshotRequest {
+      do {
+        try await self.actorSystem.journal.saveSnapshot(
+          self.state,
+          id: self.id,
+          coveredSequenceNumber: self.sequenceNumber,
+          retention: snapshotRequest.retention,
+          periodicSnapshotEvery: snapshotRequest.periodicSnapshotEvery
+        )
+      } catch {
+        self.actorSystem.log.warning(
+          "Snapshot save or retention cleanup failed for actor with id: \(self.id) at sequence number \(self.sequenceNumber): \(error)"
+        )
       }
     }
   }

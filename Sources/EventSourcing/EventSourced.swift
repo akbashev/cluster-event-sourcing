@@ -1,5 +1,5 @@
-import Distributed
-import DistributedCluster
+public import Distributed
+public import DistributedCluster
 
 @attached(member, names: named(sequenceNumber))
 @attached(extension, conformances: EventSourced)

@@ -1,7 +1,7 @@
 import SwiftCompilerPlugin
-import SwiftSyntax
+public import SwiftSyntax
 import SwiftSyntaxBuilder
-import SwiftSyntaxMacros
+public import SwiftSyntaxMacros
 
 public struct EventSourcedMacro: MemberMacro, ExtensionMacro {
   public static func expansion(
@@ -28,7 +28,7 @@ public struct EventSourcedMacro: MemberMacro, ExtensionMacro {
 
 @main
 struct EventSourcingPlugin: CompilerPlugin {
-  let providingMacros: [Macro.Type] = [
+  let providingMacros: [any Macro.Type] = [
     EventSourcedMacro.self
   ]
 }
